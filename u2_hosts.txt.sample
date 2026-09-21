@@ -1,2 +1,3 @@
 # One host/IP per line, tried after last-known and LAN scan
 10.10.10.88
+192.168.4.99

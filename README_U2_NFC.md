@@ -5,7 +5,8 @@ This directory contains rough-draft tools for using a PN532 NFC reader attached 
 Current known hardware from the show setup:
 
 - NFC reader: PN532 via CH340 serial adapter
-- Serial device: `/dev/ttyUSB0`
+- Preferred serial device: `/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0`
+- Fallback serial device: `/dev/ttyUSB0`
 - Ultimate-II+ found at show on: `10.10.10.88`
 - Ultimate firmware/banner observed: `Ultimate-II Plus 3.11 (11E)`
 - Ultimate FTP root exposed: `Flash`, `Temp`, `Usb0`
@@ -38,7 +39,7 @@ U2+:<mode>:<ultimate-path>[#entry]
 Modes currently used:
 
 - `prg` - run a PRG directly. If path is a `.d64`, extract `#entry` from the D64, then send it to `/v1/runners:run_prg`.
-- `crt` - download CRT and send it to `/v1/runners:run_crt`.
+- `crt` - download CRT and send it to `/v1/runners:run_crt`. Confirmed working under WSL with Planet X2.1 GMod2.
 - `d64` - rough fallback currently extracts `#entry` from the D64 and runs it as PRG. This worked for Monopoly in testing, but true disk mounting still needs API research.
 
 ## Ultimate discovery behavior
@@ -70,6 +71,12 @@ Run:
 
 ```bash
 sudo ./nfc_listen.py
+```
+
+Under WSL, after reboot or `wsl --shutdown`, first run:
+
+```bash
+scripts/attach-nfc-wsl.sh
 ```
 
 ### `nfc_write_text.py`

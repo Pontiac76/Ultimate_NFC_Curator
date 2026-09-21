@@ -29,6 +29,8 @@ A card was successfully detected with UID:
 04 41 6d 41 2b 02 89
 ```
 
+First full WSL tooling run was successful: NFC-driven launch worked, including a confirmed CRT launch of **Planet X2.1 GMod2**.
+
 ## Important behavior
 
 USB passthrough into WSL works, but the active attachment generally does **not** survive:
@@ -122,9 +124,26 @@ If `usbipd` is not on PATH from WSL-launched PowerShell, use the full path:
 powershell.exe -NoProfile -Command "& 'C:\Program Files\usbipd-win\usbipd.exe' list"
 ```
 
+## Bootstrap after Windows/WSL reboot
+
+This repo includes:
+
+```bash
+scripts/attach-nfc-wsl.sh
+```
+
+Run it after Windows reboot, `wsl --shutdown`, unplug/replug, or changing USB ports:
+
+```bash
+cd ~/git/GitHub/Ultimate_NFC_Curator
+scripts/attach-nfc-wsl.sh
+```
+
+If the script reports that the device is not shared/bound, run the printed `usbipd bind --busid ...` command once from **Administrator PowerShell**, then rerun the script from WSL.
+
 ## Suggested helper script
 
-Create `scripts/attach-nfc-wsl.sh` or similar:
+The checked-in `scripts/attach-nfc-wsl.sh` is based on this pattern:
 
 ```bash
 #!/usr/bin/env bash

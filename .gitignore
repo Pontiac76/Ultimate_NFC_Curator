@@ -7,6 +7,9 @@
 .venv/
 venv/
 
+# Local configuration files
+u2_hosts.txt
+
 # Runtime/local state
 .u2_state.json
 *.log
@@ -44,4 +47,3 @@ rest_key_game_candidates.csv
 rest_key_game_titles*.txt
 screen_dump_*.txt
 modplayer_screen_ansi*.txt
-
