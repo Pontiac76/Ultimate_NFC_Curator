@@ -1,0 +1,31 @@
+title	path	type	mode	entry	payload	detail
+128-Robots	/C128/Games/128-Robots.d71	d71	disk		U2+:disk:/C128/Games/128-Robots.d71	D71
+128-Robots	/C128/Games/128-Robots.d81	d81	disk		U2+:disk:/C128/Games/128-Robots.d81	D81
+Donald Duck	/d64/d/donaldtheduck.d64	d64	prg	donald duck	U2+:prg:/d64/d/donaldtheduck.d64#donald duck	D64 single PRG: donald duck
+EGA Trek C128	/C128/Games/egatrek-c128-80col.d64	d64	disk		U2+:disk:/C128/Games/egatrek-c128-80col.d64	D64 PRGs: trek128, strings.dat, music.dat, ovleval, ovlhof, ovlfront, ovlinfo, ovlrepair
+EGA Trek C128	/C128/Games/egatrek-c128-80col.d81	d81	disk		U2+:disk:/C128/Games/egatrek-c128-80col.d81	D81
+Elite	/nibs/Elite.g64	g64	disk		U2+:disk:/nibs/Elite.g64	G64
+Ghostbusters	/prg/g/ghostbusters.prg	prg	prg		U2+:prg:/prg/g/ghostbusters.prg	PRG file
+Skate or Die	/prg/skate or die-wow.prg	prg	prg		U2+:prg:/prg/skate or die-wow.prg	PRG file
+Sonic the Hedgehog	/C128/Games/Sonic_the_Hedgehog/Sonic the Hedgehog.d71	d71	disk		U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic the Hedgehog.d71	D71
+Sonic the Hedgehog	/C128/Games/Sonic_the_Hedgehog/SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81	d81	disk		U2+:disk:/C128/Games/Sonic_the_Hedgehog/SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81	D81
+Sonic the Hedgehog	/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_R5.d81	d81	disk		U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_R5.d81	D81
+Sonic the Hedgehog	/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_A_R5.d64	d64	disk		U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_A_R5.d64	D64 PRGs: sonic on c64+reu, sm, p0, p1, s1, s2, s3, s4
+Sonic the Hedgehog	/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_B_R5.d64	d64	disk		U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_B_R5.d64	D64 PRGs: e4, e5, e6, ms, m3, m4, m5, md
+Sonic the Hedgehog	/C128/_212617_25_SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81	d81	disk		U2+:disk:/C128/_212617_25_SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81	D81
+Space Empire	/SPACEEMP.TAP	tap	tap		U2+:tap:/SPACEEMP.TAP	TAP tape image (launcher support TBD)
+Spy Hunter	/prg/s/spyhunter.prg	prg	prg		U2+:prg:/prg/s/spyhunter.prg	PRG file
+Super Mario Bros 64	/nibs/SUPER MARIO BROS 64.g64	g64	disk		U2+:disk:/nibs/SUPER MARIO BROS 64.g64	G64
+Planet X2.1 GMod2	/C64/crt/Planet_X2.1_GMod2.crt	crt	crt		U2+:crt:/C64/crt/Planet_X2.1_GMod2.crt	CRT
+ramdos2	/C64/crt/ramdos2.crt	crt	crt		U2+:crt:/C64/crt/ramdos2.crt	CRT
+WeAreDemo(A)	/C64/demos/WeAreDemo(A).d64	d64	disk		U2+:disk:/C64/demos/WeAreDemo(A).d64	PRGs: 00, bf, d1, bt, i3, i4, i5, i6
+WeAreDemo(B)	/C64/demos/WeAreDemo(B).d64	d64	disk		U2+:disk:/C64/demos/WeAreDemo(B).d64	PRGs: d2, sb, d9, s3, s2, s1, l1, l2
+ULBYT6A	/C64/Nibbler/ULBYT6A.D64	d64	disk		U2+:disk:/C64/Nibbler/ULBYT6A.D64	PRGs: ultra/boot, a, b
+ULBYT6B	/C64/Nibbler/ULBYT6B.D64	d64	disk		U2+:disk:/C64/Nibbler/ULBYT6B.D64	PRGs: accolade's comic, age of adventure, aliens, amer. challenge, american cup, artic fox, bard's tale i v1, bard's tale i v2
+ghostbusters	/C64/Games/Ghostbusters/ghostbusters.d64	d64	prg	ghostbusters	U2+:prg:/C64/Games/Ghostbusters/ghostbusters.d64#ghostbusters	single PRG: ghostbusters
+Hot Wheels (Epyx)(A)[7786]	/C64/Games/Hot Wheels/Hot Wheels (Epyx)(A)[7786].d64	d64	disk		U2+:disk:/C64/Games/Hot Wheels/Hot Wheels (Epyx)(A)[7786].d64	PRGs: hot wheels boot, -hot wheels boot, epyx, lg, main, title, ac, wa
+Hot Wheels (Epyx)(B)[7786]	/C64/Games/Hot Wheels/Hot Wheels (Epyx)(B)[7786].d64	d64	disk		U2+:disk:/C64/Games/Hot Wheels/Hot Wheels (Epyx)(B)[7786].d64	PRGs: ac, wa, world, a1, c8, adgas, a4, wb
+Hot Wheels (Epyx)[7786].d71	/C64/Games/Hot Wheels/Hot Wheels (Epyx)[7786].d71	d71	disk		U2+:disk:/C64/Games/Hot Wheels/Hot Wheels (Epyx)[7786].d71	D71
+MonopolyDeluxe	/C64/Games/Monopoly/MonopolyDeluxe.d64	d64	disk		U2+:disk:/C64/Games/Monopoly/MonopolyDeluxe.d64	PRGs: monopoly deluxe, mon1, mon2, mon3, mon4, mon5, mon6, mon7
+retaliatedx	/C64/Games/RetaliateDX/retaliatedx.d64	d64	disk		U2+:disk:/C64/Games/RetaliateDX/retaliatedx.d64	PRGs: retaliate, ret-en, ret-ptbr, ret-es, retdata
+1764 demo	/C64/Utilities/Working Images/1764-demo.d64	d64	disk		U2+:disk:/C64/Utilities/Working Images/1764-demo.d64	PRGs: startup.111286, dos wedge.100186, dos wedge.bin, ramdos040887.bas, ramdos040887.bin, filecopy.111286, filecopy.bin, change unit #

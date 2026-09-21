@@ -1,0 +1,28 @@
+title	payload	mode	path	entry	machine_mode	file_type	detail	status	notes
+128-Robots	U2+:disk:/C128/Games/128-Robots.d71	disk	/C128/Games/128-Robots.d71		c128	d71	D71		
+128-Robots	U2+:disk:/C128/Games/128-Robots.d81	disk	/C128/Games/128-Robots.d81		c128	d81	D81	approved	
+1764 demo	U2+:disk:/C64/Utilities/Working Images/1764-demo.d64	disk	/C64/Utilities/Working Images/1764-demo.d64		c64	d64	PRGs: startup.111286, dos wedge.100186, dos wedge.bin, ramdos040887.bas, ramdos040887.bin, filecopy.111286, filecopy.bin, change unit #		
+Donald Duck	U2+:prg:/d64/d/donaldtheduck.d64#donald duck	prg	/d64/d/donaldtheduck.d64	donald duck	c64	d64	D64 single PRG: donald duck	approved	
+EGA Trek C128	U2+:disk:/C128/Games/egatrek-c128-80col.d64#trek128	disk	/C128/Games/egatrek-c128-80col.d64	trek128	c128	d64	D64 PRGs: trek128, strings.dat, music.dat, ovleval, ovlhof, ovlfront, ovlinfo, ovlrepair	approved	
+EGA Trek C128	U2+:disk:/C128/Games/egatrek-c128-80col.d81#trek128	disk	/C128/Games/egatrek-c128-80col.d81	trek128	c128	d81	D81		
+ghostbusters	U2+:prg:/C64/Games/Ghostbusters/ghostbusters.d64#ghostbusters	prg	/C64/Games/Ghostbusters/ghostbusters.d64	ghostbusters	c64	d64	single PRG: ghostbusters		
+Ghostbusters	U2+:prg:/prg/g/ghostbusters.prg	prg	/prg/g/ghostbusters.prg		c64	prg	PRG file	approved	
+Hot Wheels (Epyx)(A)[7786]	U2+:disk:/C64/Games/Hot Wheels/Hot Wheels (Epyx)(A)[7786].d64	disk	/C64/Games/Hot Wheels/Hot Wheels (Epyx)(A)[7786].d64		c64	d64	PRGs: hot wheels boot, -hot wheels boot, epyx, lg, main, title, ac, wa		
+Hot Wheels (Epyx)(B)[7786]	U2+:disk:/C64/Games/Hot Wheels/Hot Wheels (Epyx)(B)[7786].d64	disk	/C64/Games/Hot Wheels/Hot Wheels (Epyx)(B)[7786].d64		c64	d64	PRGs: ac, wa, world, a1, c8, adgas, a4, wb		
+Hot Wheels (Epyx)[7786].d71	U2+:disk:/C64/Games/Hot Wheels/Hot Wheels (Epyx)[7786].d71	disk	/C64/Games/Hot Wheels/Hot Wheels (Epyx)[7786].d71		c64	d71	D71	approved	
+MonopolyDeluxe	U2+:disk:/C64/Games/Monopoly/MonopolyDeluxe.d64#monopoly deluxe	disk	/C64/Games/Monopoly/MonopolyDeluxe.d64	monopoly deluxe	c64	d64	PRGs: monopoly deluxe, mon1, mon2, mon3, mon4, mon5, mon6, mon7	failed	
+Planet X2.1 GMod2	U2+:crt:/C64/crt/Planet_X2.1_GMod2.crt	crt	/C64/crt/Planet_X2.1_GMod2.crt		c64	crt	CRT		
+ramdos2	U2+:crt:/C64/crt/ramdos2.crt	crt	/C64/crt/ramdos2.crt		c64	crt	CRT		
+retaliatedx	U2+:disk:/C64/Games/RetaliateDX/retaliatedx.d64	disk	/C64/Games/RetaliateDX/retaliatedx.d64		c64	d64	PRGs: retaliate, ret-en, ret-ptbr, ret-es, retdata		
+Skate or Die	U2+:prg:/prg/skate or die-wow.prg	prg	/prg/skate or die-wow.prg		c64	prg	PRG file		
+Sonic the Hedgehog	U2+:disk:/C128/_212617_25_SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81	disk	/C128/_212617_25_SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81		c64	d81	D81	approved	
+Sonic the Hedgehog	U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic the Hedgehog.d71	disk	/C128/Games/Sonic_the_Hedgehog/Sonic the Hedgehog.d71		c64	d71	D71		
+Sonic the Hedgehog	U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_R5.d81	disk	/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_R5.d81		c64	d81	D81		
+Sonic the Hedgehog	U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_A_R5.d64	disk	/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_A_R5.d64		c64	d64	D64 PRGs: sonic on c64+reu, sm, p0, p1, s1, s2, s3, s4		
+Sonic the Hedgehog	U2+:disk:/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_B_R5.d64	disk	/C128/Games/Sonic_the_Hedgehog/Sonic_the_Hedgehog_Side_B_R5.d64		c64	d64	D64 PRGs: e4, e5, e6, ms, m3, m4, m5, md		
+Sonic the Hedgehog	U2+:disk:/C128/Games/Sonic_the_Hedgehog/SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81	disk	/C128/Games/Sonic_the_Hedgehog/SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81		c64	d81	D81		
+Spy Hunter	U2+:prg:/prg/s/spyhunter.prg	prg	/prg/s/spyhunter.prg		c64	prg	PRG file	approved	
+ULBYT6A	U2+:disk:/C64/Nibbler/ULBYT6A.D64	disk	/C64/Nibbler/ULBYT6A.D64		c64	d64	PRGs: ultra/boot, a, b		
+ULBYT6B	U2+:disk:/C64/Nibbler/ULBYT6B.D64	disk	/C64/Nibbler/ULBYT6B.D64		c64	d64	PRGs: accolade's comic, age of adventure, aliens, amer. challenge, american cup, artic fox, bard's tale i v1, bard's tale i v2		
+WeAreDemo(A)	U2+:disk:/C64/demos/WeAreDemo(A).d64	disk	/C64/demos/WeAreDemo(A).d64		c64	d64	PRGs: 00, bf, d1, bt, i3, i4, i5, i6	failed	
+WeAreDemo(B)	U2+:disk:/C64/demos/WeAreDemo(B).d64	disk	/C64/demos/WeAreDemo(B).d64		c64	d64	PRGs: d2, sb, d9, s3, s2, s1, l1, l2	failed	

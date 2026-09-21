@@ -1,0 +1,2 @@
+# One host/IP per line, tried after last-known and LAN scan
+10.10.10.88

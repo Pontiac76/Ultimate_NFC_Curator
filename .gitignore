@@ -1,0 +1,47 @@
+# Python
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# Runtime/local state
+.u2_state.json
+*.log
+
+# Temporary/editor files
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Other disk/media images likely not wanted in git
+**/*.d64
+**/*.d71
+**/*.d81
+**/*.g64
+**/*.tap
+**/*.crt
+**/*.prg
+**/*.d80
+**/*.d82
+**/*.zip
+**/*.7z
+**/*.rar
+
+# Generated inventory/export/reference files
+all_key_candidates.*
+all_key_game_titles*.txt
+game_candidates.*
+game_titles*.txt
+approved_games.*
+inventory.csv
+rest_key_game_candidates.csv
+rest_key_game_titles*.txt
+screen_dump_*.txt
+modplayer_screen_ansi*.txt
+

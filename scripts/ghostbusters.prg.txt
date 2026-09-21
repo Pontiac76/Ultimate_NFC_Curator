@@ -1,0 +1,14 @@
+# Launch script. Commands run AFTER default LOAD/RUN or DMA launch.
+# Blank lines, # comments, and unknown commands are ignored.
+# Commands:
+#   sleep 15
+#   delay 1
+#   waitfor READY 10
+#   sendkey some text/n
+# /n means Enter. Text is chunked for keyboard buffer limits.
+
+
+[/prg/g/ghostbusters.prg]
+waitfortext "hit any key" 15
+sleep 3
+sendkey a

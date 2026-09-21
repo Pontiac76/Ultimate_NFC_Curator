@@ -1,0 +1,37 @@
+# Ultimate NFC launch script help
+# Commands before a prehelp marker are post-launch commands:
+#   sleep 15
+#   delay 1
+#   waitfortext READY 10
+#   waitforexacttext READY 10
+#   sendkey some text/n        (/n means Enter)
+#
+# Pre-run help for disk launches:
+#   A standalone _ or prehelp switches the rest of THAT SECTION to literal
+#   screen text. After that marker, # is displayed, not treated as a comment.
+#   Use this near the end so comments/help below do not appear on screen.
+#
+# Prehelp control tags:
+#   {CLR}      clear screen and fill text color with background color
+#   {HOME}     move help renderer to row 0, column 0
+#   {HIDE}     switch to current background color; also marks cursor target line
+#
+# Color tags:
+#   {BLACK} {WHITE} {RED} {CYAN} {PURPLE} {GREEN} {BLUE} {YELLOW}
+#   {ORANGE} {BROWN} {LTRED} {DKGRAY} {GRAY} {LTGREEN} {LTBLUE} {LTGRAY}
+#
+# Example:
+#   _
+#   {CLR}{WHITE}Game title
+#   {LTRED}Important:{WHITE} Press {GREEN}Y{WHITE} if asked.
+#   {LTBLUE}Press ENTER to start.
+#   {HIDE}run
+
+
+[/C128/Games/Sonic_the_Hedgehog/SonicTheHedgehog_v1.2+5_-TRIAD+GP.d81]
+# _
+# {CLR}{WHITE}Instructions go here. {GREEN}Press ENTER to start.
+# {HIDE}run
+#
+# sleep 15
+# sendkey /n
