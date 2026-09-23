@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rough curses curator: browse inventory, test launch, approve, export approved CSV."""
+"""Rough curses curator: browse inventory, test launch, approve, persist SQLite state."""
 
 import argparse
 import contextlib
@@ -10,9 +10,14 @@ import re
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 from pathlib import Path
 from u2_common import *
+try:
+    from u2_nfc_launcher import open_serial, require_response, find_tag, read_ntag_memory, parse_ndef_tlv, decode_first_ndef_text_or_uri
+except Exception:
+    open_serial = require_response = find_tag = read_ntag_memory = parse_ndef_tlv = decode_first_ndef_text_or_uri = None
 
 FIELDS = ["title", "payload", "mode", "path", "entry", "machine_mode", "file_type", "detail", "status", "notes"]
 UNSUPPORTED_EXTS = (".g64", ".tap")
@@ -225,10 +230,10 @@ def run_console_command(host, command, mode):
     elif cmd == "status":
         print_drive_status(host)
     elif cmd == "reset":
-        status, body = api_put(host, "/v1/machine:reset")
+        status, body = reset_machine(host)
         print(f"reset HTTP {status}: {body.strip()}")
     elif cmd == "reboot":
-        status, body = api_put(host, "/v1/machine:reboot")
+        status, body = reboot_machine(host)
         print(f"reboot HTTP {status}: {body.strip()}")
     elif cmd in ("unmount", "remove", "eject"):
         drive = drive_arg(parts[1] if len(parts) > 1 else "a")
@@ -281,8 +286,6 @@ def write_nfc_for_row(row):
     title = row.get("title", "")
     writer = Path(__file__).with_name("nfc_write_text.py")
     cmd = [sys.executable, str(writer), "--yes", payload]
-    if os.geteuid() != 0:
-        cmd.insert(0, "sudo")
 
     print("\n" + "=" * 72)
     print(f"Write NFC card for: {title}")
@@ -536,6 +539,8 @@ def show_help(stdscr):
         "  PgUp/PgDn       Move one page",
         "  Home/End        Jump first/last item",
         "  /                Plain-text search/filter; blank clears",
+        "  V                Choose SQL view/filter",
+        "  H                Hunt/select row by tapping an NFC card",
         "  $                Show selected disk directory",
         "",
         "Game status/actions:",
@@ -553,7 +558,7 @@ def show_help(stdscr):
         "",
         "Editing/saving:",
         "  k                Edit post-launch key script for selected image",
-        "  e                Edit launch mode/entry (* clears entry)",
+        "  e                Edit soft title, launch mode/entry (* clears entry)",
         "  s                Save state and approved list",
         "  G  (capital G)   Send GO64, wait for prompt, then send Y",
         "  B  (capital B)   Reboot Ultimate/machine via API",
@@ -687,11 +692,11 @@ def command_groups(row=None, issue=""):
     is_disk = path.lower().endswith((".d64", ".d71", ".d81"))
     can_test = not issue
     return [
-        ("Nav", [("↑/↓ move", True), ("PgUp/PgDn", True), ("Home/End", True), ("/ search", True), ("$ dir", is_disk), ("? help", True), ("q save+quit", True)]),
+        ("Nav", [("↑/↓ move", True), ("PgUp/PgDn", True), ("Home/End", True), ("/ search", True), ("V view", True), ("H hunt tag", True), ("$ dir", is_disk), ("? help", True), ("q save+quit", True)]),
         ("Curate", [("Space/a approve", True), ("t test", can_test), ("T test no help", can_test), ("1 64/128", True), ("f failed", True), ("u unmark", True)]),
         ("NFC", [("w write", True), ("r read", True), ("m monitor", True)]),
         ("U2", [("M mount image", is_disk), ("D disk swap", False), ("G GO64/Y", True), ("B reboot", True), ("C console", True)]),
-        ("Edit", [("k script", True), ("e entry", True), ("s save", True)]),
+        ("Edit", [("k script", True), ("e title/entry", True), ("s save", True)]),
     ]
 
 
@@ -747,6 +752,176 @@ def row_matches_search(row, query):
     return q in hay
 
 
+def row_identity(row):
+    return row.get("path") or row.get("payload") or row.get("title", "")
+
+
+DEFAULT_SQL_VIEWS = [
+    ("Normal active rows", "SELECT * FROM image_rows WHERE COALESCE(storage_status, 'present') = 'present' AND COALESCE(quarantined, 0) = 0 AND COALESCE(file_type_enabled, 1) = 1 ORDER BY title, path"),
+    ("Approved", "SELECT * FROM image_rows WHERE status = 'approved' ORDER BY title, path"),
+    ("Failed", "SELECT * FROM image_rows WHERE status = 'failed' ORDER BY title, path"),
+    ("C64", "SELECT * FROM image_rows WHERE machine_mode IN ('', 'c64', '64') ORDER BY title, path"),
+    ("C128", "SELECT * FROM image_rows WHERE machine_mode IN ('c128', '128') ORDER BY title, path"),
+    ("CRT", "SELECT * FROM image_rows WHERE file_type = 'crt' OR path LIKE '%.crt' ORDER BY title, path"),
+]
+
+
+def sql_title_from_file(path):
+    first = Path(path).read_text(errors="replace").splitlines()[0:1]
+    if first and first[0].lstrip().startswith("--"):
+        title = first[0].lstrip()[2:].strip()
+        if title:
+            return title
+    return Path(path).stem
+
+
+def load_sql_view_choices():
+    choices = [("All loaded rows", None, "Clear SQL view/filter")]
+    choices.extend((name, sql, "Built-in") for name, sql in DEFAULT_SQL_VIEWS)
+    sql_dir = Path("sql")
+    if sql_dir.exists():
+        for p in sorted(sql_dir.glob("*.sql")):
+            try:
+                choices.append((sql_title_from_file(p), p.read_text(errors="replace"), str(p)))
+            except Exception:
+                pass
+    return choices
+
+
+def show_error_popup(stdscr, title, message):
+    lines = [title, ""] + str(message).splitlines() + ["", "Press any key to continue."]
+    top = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        body_h = max(1, h - 1)
+        max_top = max(0, len(lines) - body_h)
+        top = max(0, min(top, max_top))
+        for y, line in enumerate(lines[top:top + body_h]):
+            abs_i = top + y
+            attr = curses.A_BOLD if abs_i == 0 else 0
+            if abs_i == 0 and curses.has_colors():
+                attr |= curses.color_pair(2)
+            stdscr.addnstr(y, 0, line, w-1, attr)
+        footer = "↑/↓ scroll  PgUp/PgDn page  Home/End  any key return"
+        if len(lines) > body_h:
+            footer += f"  {top+1}-{min(len(lines), top+body_h)}/{len(lines)}"
+        stdscr.addnstr(h-1, 0, footer, w-1, curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch == curses.KEY_UP:
+            top -= 1
+        elif ch == curses.KEY_DOWN:
+            top += 1
+        elif ch == curses.KEY_PPAGE:
+            top -= body_h
+        elif ch == curses.KEY_NPAGE:
+            top += body_h
+        elif ch == curses.KEY_HOME:
+            top = 0
+        elif ch == curses.KEY_END:
+            top = max_top
+        else:
+            return
+
+
+def select_sql_view(stdscr, current_name="All loaded rows"):
+    choices = load_sql_view_choices()
+    pos = next((i for i, c in enumerate(choices) if c[0] == current_name), 0)
+    top = max(0, pos - 3)
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        body_h = max(1, h - 3)
+        if pos < top:
+            top = pos
+        if pos >= top + body_h:
+            top = pos - body_h + 1
+        stdscr.addnstr(0, 0, "Select SQL view", w-1, curses.A_BOLD)
+        stdscr.addnstr(1, 0, "Built-ins plus sql/*.sql. First '-- comment' line becomes the title.", w-1, curses.A_DIM)
+        for y, idx in enumerate(range(top, min(len(choices), top + body_h)), start=2):
+            name, _sql, source = choices[idx]
+            line = f"{name}  [{source}]"
+            attr = curses.A_REVERSE if idx == pos else 0
+            stdscr.addnstr(y, 0, line, w-1, attr)
+        footer = "↑/↓ move  Enter apply  q/Esc cancel"
+        stdscr.addnstr(h-1, 0, footer, w-1, curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord('q'), 27):
+            return None
+        if ch in (10, 13):
+            return choices[pos]
+        if ch == curses.KEY_UP:
+            pos = max(0, pos - 1)
+        elif ch == curses.KEY_DOWN:
+            pos = min(len(choices) - 1, pos + 1)
+        elif ch == curses.KEY_PPAGE:
+            pos = max(0, pos - body_h)
+        elif ch == curses.KEY_NPAGE:
+            pos = min(len(choices) - 1, pos + body_h)
+        elif ch == curses.KEY_HOME:
+            pos = 0
+        elif ch == curses.KEY_END:
+            pos = len(choices) - 1
+
+
+def card_payload_path(text):
+    if not text or not text.startswith("U2+:"):
+        return ""
+    body = text[4:]
+    if ":" in body:
+        mode, rest = body.split(":", 1)
+        if mode in ("prg", "crt", "disk", "d64", "tap"):
+            body = rest
+    path = body.partition("#")[0]
+    return strip_usb_prefix(path)
+
+
+def read_one_nfc_payload(device="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0", baud=115200, timeout=20):
+    if not open_serial:
+        raise RuntimeError("NFC reader helpers unavailable")
+    if not Path(device).exists() and Path("/dev/ttyUSB0").exists():
+        device = "/dev/ttyUSB0"
+    baud_const = getattr(termios, f"B{baud}")
+    fd = open_serial(device, baud_const)
+    try:
+        require_response(fd, [0x14, 0x01], 0x15, timeout=1.0)
+        deadline = time.time() + timeout
+        last_uid = None
+        while time.time() < deadline:
+            uid = find_tag(fd)
+            if uid and uid != last_uid:
+                memory = read_ntag_memory(fd)
+                text = decode_first_ndef_text_or_uri(parse_ndef_tlv(memory))
+                if text:
+                    return text
+                last_uid = uid
+            time.sleep(0.2)
+    finally:
+        os.close(fd)
+    raise TimeoutError("Timed out waiting for NFC card")
+
+
+def sql_view_keys(db_path, sql):
+    if sql is None:
+        return None, None
+    if not is_sqlite_path(db_path) or not Path(db_path).exists():
+        raise RuntimeError(f"SQL views require an existing SQLite DB: {db_path}")
+    with sqlite_connect(db_path) as conn:
+        ensure_rows_table(conn)
+        result = conn.execute(sql).fetchall()
+    ordered = []
+    seen = set()
+    for row in result:
+        d = dict(row)
+        key = row_identity(d)
+        if key and key not in seen:
+            ordered.append(key)
+            seen.add(key)
+    return seen, {key: i for i, key in enumerate(ordered)}
+
+
 def run(stdscr, rows, host, out, log_path, state_path):
     curses.curs_set(0)
     if curses.has_colors():
@@ -762,6 +937,9 @@ def run(stdscr, rows, host, out, log_path, state_path):
     top = 0
     msg = ""
     search_query = ""
+    sql_view_name = "All loaded rows"
+    sql_filter_keys = None
+    sql_filter_rank = None
     for r in rows:
         if not r.get("file_type") and r.get("type"):
             r["file_type"] = r.get("type", "")
@@ -775,7 +953,13 @@ def run(stdscr, rows, host, out, log_path, state_path):
         r.setdefault("notes", "")
         r.setdefault("machine_mode", "c64")
     while True:
-        visible = [i for i, r in enumerate(rows) if row_matches_search(r, search_query)]
+        visible = [
+            i for i, r in enumerate(rows)
+            if (sql_filter_keys is None or row_identity(r) in sql_filter_keys)
+            and row_matches_search(r, search_query)
+        ]
+        if sql_filter_rank is not None:
+            visible.sort(key=lambda i: sql_filter_rank.get(row_identity(rows[i]), 10**9))
         if visible and pos not in visible:
             pos = visible[0]
             top = 0
@@ -785,6 +969,8 @@ def run(stdscr, rows, host, out, log_path, state_path):
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         title = "Ultimate2+ C64 curator"
+        if sql_view_name != "All loaded rows":
+            title += f"  view:{sql_view_name}"
         if search_query:
             title += f"  /{search_query}"
         stdscr.addnstr(0, 0, title, w-1, curses.A_BOLD)
@@ -854,7 +1040,7 @@ def run(stdscr, rows, host, out, log_path, state_path):
         stdscr.refresh()
 
         ch = stdscr.getch()
-        if not visible and ch not in (ord('?'), ord('/'), ord('q'), ord('s'), curses.KEY_UP, curses.KEY_DOWN):
+        if not visible and ch not in (ord('?'), ord('/'), ord('V'), ord('H'), ord('h'), ord('q'), ord('s'), curses.KEY_UP, curses.KEY_DOWN):
             msg = "No selected row; clear or change search"
             continue
         if ch == ord('?'):
@@ -872,6 +1058,39 @@ def run(stdscr, rows, host, out, log_path, state_path):
             curses.noecho(); curses.curs_set(0)
             top = 0
             msg = "Search cleared" if not search_query else f"Search: {search_query}"
+        elif ch == ord('V'):
+            choice = select_sql_view(stdscr, sql_view_name)
+            if choice:
+                name, sql, _source = choice
+                try:
+                    sql_filter_keys, sql_filter_rank = sql_view_keys(state_path, sql)
+                    sql_view_name = name
+                    top = 0
+                    if visible:
+                        pos = visible[0]
+                    msg = f"SQL view: {name}"
+                except Exception as e:
+                    msg = f"SQL view failed: {e}"
+                    show_error_popup(stdscr, "SQL view failed", f"View: {name}\n\n{e}\n\nPrevious view remains active: {sql_view_name}")
+        elif ch in (ord('H'), ord('h')):
+            curses.endwin()
+            try:
+                print("Tap NFC card to hunt/select matching row...", flush=True)
+                text = read_one_nfc_payload()
+                path = card_payload_path(text)
+                match = next((i for i, row in enumerate(rows) if strip_usb_prefix(row.get("path", "")) == path), None)
+                if match is None:
+                    msg = f"No row matched card payload: {text}"
+                else:
+                    pos = match
+                    search_query = ""
+                    sql_filter_keys = None
+                    sql_filter_rank = None
+                    sql_view_name = "All loaded rows"
+                    top = 0
+                    msg = f"Selected from card: {rows[pos].get('title','')}"
+            except Exception as e:
+                msg = f"NFC hunt failed: {e}"
         elif ch == curses.KEY_UP:
             if visible:
                 vi = visible.index(pos)
@@ -926,8 +1145,6 @@ def run(stdscr, rows, host, out, log_path, state_path):
             curses.endwin()
             monitor = Path(__file__).with_name("u2_tag_monitor.py")
             cmd = [sys.executable, str(monitor), "--ultimate", "auto", "--state", state_path, "--state", out]
-            if os.geteuid() != 0:
-                cmd.insert(0, "sudo")
             subprocess.call(cmd)
             msg = "Returned from NFC monitor"
             status_rows, status_err = refresh_status_rows(host)
@@ -935,8 +1152,6 @@ def run(stdscr, rows, host, out, log_path, state_path):
             curses.endwin()
             monitor = Path(__file__).with_name("u2_tag_monitor.py")
             cmd = [sys.executable, str(monitor), "--ultimate", "auto", "--state", state_path, "--state", out, "--no-launch"]
-            if os.geteuid() != 0:
-                cmd.insert(0, "sudo")
             subprocess.call(cmd)
             msg = "Returned from NFC read-only monitor"
             status_rows, status_err = refresh_status_rows(host)
@@ -971,8 +1186,8 @@ def run(stdscr, rows, host, out, log_path, state_path):
             status_rows, status_err = refresh_status_rows(host)
         elif ch == ord('B'):
             try:
-                status, body = api_put(host, "/v1/machine:reboot")
-                msg = f"Reboot requested HTTP {status}: {body.strip()}"
+                status, body = reboot_machine(host)
+                msg = f"Cleared cartridge; reboot requested HTTP {status}: {body.strip()}"
             except Exception as e:
                 msg = f"Reboot failed: {e}"
             status_rows, status_err = refresh_status_rows(host)
@@ -1037,20 +1252,29 @@ def run(stdscr, rows, host, out, log_path, state_path):
             status_rows, status_err = refresh_status_rows(host)
         elif ch == ord('e'):
             curses.echo(); curses.curs_set(1)
+            prompt = f"New soft title (blank keeps {rows[pos].get('title','')!r}): "
+            stdscr.move(h-1, 0); stdscr.clrtoeol()
+            stdscr.addnstr(h-1, 0, prompt, w-1)
+            stdscr.refresh()
+            title = stdscr.getstr(h-1, min(len(prompt), w-2), 120).decode(errors="replace").strip()
+
             # Highlight the exact field being edited in the detail panel.
             draw_detail_panel(stdscr, detail_y, w, rows[pos], highlight="mode")
             prompt = "New launch mode (prg/crt/disk; blank keeps current): "
+            stdscr.move(h-1, 0); stdscr.clrtoeol()
             stdscr.addnstr(h-1, 0, prompt, w-1)
-            stdscr.clrtoeol(); stdscr.refresh()
-            mode = stdscr.getstr(h-1, len(prompt), 20).decode().strip()
+            stdscr.refresh()
+            mode = stdscr.getstr(h-1, len(prompt), 20).decode(errors="replace").strip()
 
             stdscr.move(h-1, 0); stdscr.clrtoeol()
             draw_detail_panel(stdscr, detail_y, w, rows[pos], highlight="entry")
             prompt = "New disk PRG entry / loader name (blank keeps current, * clears, $ dir): "
             stdscr.addnstr(h-1, 0, prompt, w-1)
             stdscr.clrtoeol(); stdscr.refresh()
-            entry = stdscr.getstr(h-1, len(prompt), 60).decode().strip()
+            entry = stdscr.getstr(h-1, len(prompt), 60).decode(errors="replace").strip()
             curses.noecho(); curses.curs_set(0)
+            if title:
+                rows[pos]["title"] = title
             if mode:
                 if mode in ("prg", "crt", "disk"):
                     rows[pos]["mode"] = mode
@@ -1068,7 +1292,7 @@ def run(stdscr, rows, host, out, log_path, state_path):
             elif entry:
                 rows[pos]["entry"] = entry
             rows[pos]["payload"] = payload_for(rows[pos]["mode"], rows[pos]["path"], rows[pos].get("entry", ""))
-            msg = "Updated launch mode/entry"
+            msg = "Updated title/mode/entry"
         elif ch == ord('q'):
             n = save_approved(rows, out)
             save_state(rows, state_path)
@@ -1077,11 +1301,11 @@ def run(stdscr, rows, host, out, log_path, state_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("inventory", nargs="?", default="rest_key_game_candidates.tsv")
-    ap.add_argument("--out", default="approved_games.csv")
+    ap.add_argument("inventory", nargs="?", default="curator.db")
+    ap.add_argument("--out", default="curator.db")
     ap.add_argument("--ultimate", default="auto")
     ap.add_argument("--log", default="u2_curate_tui.log")
-    ap.add_argument("--state", default="curator_state.tsv", help="TSV preserving approved/failed/launched/skipped rows")
+    ap.add_argument("--state", default="curator.db", help="SQLite DB preserving approved/failed/launched/skipped rows")
     ap.add_argument("--include-unsupported", action="store_true", help="show G64/TAP rows too")
     ap.add_argument("--import-approved", action="store_true", help="one-time import approved manifest even when curator state exists, then archive it")
     args = ap.parse_args()
@@ -1090,14 +1314,22 @@ def main():
         raise SystemExit(1)
     rows = read_csv(args.inventory)
     if not rows:
-        raise SystemExit(f"No rows in {args.inventory}")
+        print(f"No image rows found in {args.inventory}.")
+        ans = input("Run inventory scan now to populate it? [Y/n] ").strip().lower()
+        if ans in ("", "y", "yes"):
+            inv = Path(__file__).with_name("u2_inventory.py")
+            cmd = [sys.executable, str(inv), "--ultimate", args.ultimate, "--out", args.inventory]
+            subprocess.check_call(cmd)
+            rows = read_csv(args.inventory)
+        if not rows:
+            raise SystemExit(f"No rows in {args.inventory}; run ./u2_inventory.py first.")
 
     imported_state = merge_settings(rows, args.state)
     if imported_state:
         print(f"Imported {imported_state} prior state row(s) from {args.state}.")
 
     # Approved manifests are treated as one-time migration/import sources.
-    # Normal persistence should come from curator_state.tsv; otherwise stale
+    # Normal persistence should come from curator.db; otherwise stale
     # generated entries can keep re-entering the curated working set.
     imported_approved = 0
     if args.import_approved or not imported_state:

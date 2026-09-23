@@ -24,3 +24,33 @@ one reader + one Python launcher + one Ultimate target
 ```
 
 Scale by adding another small host/device, not by making one launcher multiplex multiple readers.
+
+## Do not overload disk entry with magic DMA semantics
+
+Decision: do **not** use special/magic characters in a disk image `entry` value to mean "extract this internal PRG and launch it via DMA/run_prg instead of mounting the disk."
+
+Avoid schemes like:
+
+```text
+entry = @FROGGER
+entry = !FROGGER
+entry = ^FROGGER
+```
+
+Reasoning:
+
+- `entry` should mean the mounted-disk `LOAD` target only.
+- Magic prefixes make one field carry two separate meanings: load target and launch-mode override.
+- It creates hidden behavior that has to be remembered later.
+- It makes the UI misleading: a row that appears to be a disk launch would actually behave like a PRG launch.
+- It can conflict with weird but legitimate CBM filenames.
+- Troubleshooting becomes harder when launch behavior is encoded in punctuation.
+
+Keep the rule simple:
+
+```text
+.prg file    -> DMA/run_prg
+.disk image  -> mount disk, then LOAD entry or LOAD"*"
+```
+
+If internal disk programs ever need to be first-class launch targets, model that explicitly with a future table such as `ImageEntry`, not with magic text in `entry`.

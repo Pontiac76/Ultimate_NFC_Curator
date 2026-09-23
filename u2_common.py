@@ -7,7 +7,10 @@ import ipaddress
 import json
 import os
 import socket
+import sqlite3
 import subprocess
+import shutil
+import tempfile
 import time
 import shlex
 import re
@@ -19,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STATE_FILE = Path(".u2_state.json")
 HOSTS_FILE = Path("u2_hosts.txt")
-DEFAULT_ROOT = "/C64"
+DEFAULT_ROOT = "/"
 
 
 def is_ignored_iface(name):
@@ -251,7 +254,7 @@ def note_usb_success(requested, used):
         save_state(last_usb=0)
     elif used.startswith("/Usb1"):
         save_state(last_usb=1)
-    if used != requested:
+    if used != requested and os.environ.get("U2_VERBOSE_USB_FALLBACK"):
         print(f"Note: {requested} failed; using {used}")
 
 
@@ -347,87 +350,72 @@ def parse_ftp_list(lines):
     return rows
 
 
-def petscii_name(bs):
-    bs = bytes(bs).split(b"\xa0")[0]
-    out = ""
-    for b in bs:
-        if 65 <= b <= 90:
-            out += chr(b).lower()
-        elif 193 <= b <= 218:
-            out += chr(b - 128).lower()
-        elif 32 <= b <= 126:
-            out += chr(b)
-    return out.strip()
+def c1541_available():
+    return shutil.which("c1541") is not None
 
 
-def d64_directory(img):
-    spt = [0] + [21] * 17 + [19] * 7 + [18] * 6 + [17] * 5
-    offsets = [0]
-    pos = 0
-    for track in range(1, 36):
-        offsets.append(pos)
-        pos += spt[track] * 256
-
-    def tso(t, s):
-        return offsets[t] + s * 256
-
-    files = []
-    t, sec = 18, 1
-    seen = set()
-    while t and (t, sec) not in seen and t < len(offsets):
-        seen.add((t, sec))
-        block = img[tso(t, sec):tso(t, sec)+256]
-        for i in range(8):
-            e = block[2+i*32:2+(i+1)*32]
-            if not e or e[0] == 0:
-                continue
-            ft = e[0] & 7
-            files.append({
-                "name": petscii_name(e[3:19]),
-                "type": {0:"DEL",1:"SEQ",2:"PRG",3:"USR",4:"REL"}.get(ft, str(ft)),
-                "blocks": e[28] + 256 * e[29],
-                "track": e[1],
-                "sector": e[2],
-            })
-        t, sec = block[0], block[1]
-    return files
+def c1541_directory_from_file(image_file):
+    if not c1541_available():
+        raise RuntimeError("c1541 is not installed; run scripts/setup-pi.sh or install VICE")
+    r = subprocess.run(["c1541", str(image_file), "-list"], text=True, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "c1541 -list failed").strip())
+    entries = []
+    disk_name = ""
+    disk_id = ""
+    blocks_free = None
+    for line in r.stdout.splitlines():
+        m = re.match(r'\s*0\s+"([^"]*)"\s*(.*)$', line)
+        if m:
+            disk_name = m.group(1).strip()
+            disk_id = m.group(2).strip()
+            continue
+        m = re.match(r'\s*(\d+)\s+"([^"]+)"\s+(\S+)', line)
+        if m:
+            entries.append({"blocks": int(m.group(1)), "name": m.group(2).strip(), "type": m.group(3).upper()})
+            continue
+        m = re.match(r'\s*(\d+)\s+blocks free\.', line, re.I)
+        if m:
+            blocks_free = int(m.group(1))
+    return {"disk_name": disk_name, "disk_id": disk_id, "blocks_free": blocks_free, "entries": entries, "raw": r.stdout}
 
 
-def extract_prg_from_d64(img, wanted_name):
-    wanted = wanted_name.strip().lower()
-    files = d64_directory(img)
-    match = next((f for f in files if f["type"] == "PRG" and f["name"].lower() == wanted), None)
-    if not match:
-        raise RuntimeError(f"PRG {wanted_name!r} not found. Available: {[f['name'] for f in files if f['type']=='PRG']}")
+def c1541_directory(img, suffix=".d64"):
+    fd, tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(img)
+        return c1541_directory_from_file(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
 
-    spt = [0] + [21] * 17 + [19] * 7 + [18] * 6 + [17] * 5
-    offsets = [0]
-    pos = 0
-    for track in range(1, 36):
-        offsets.append(pos)
-        pos += spt[track] * 256
 
-    def tso(t, s):
-        return offsets[t] + s * 256
-
-    data = bytearray()
-    t, sec = match["track"], match["sector"]
-    seen = set()
-    while t and (t, sec) not in seen:
-        seen.add((t, sec))
-        block = img[tso(t, sec):tso(t, sec)+256]
-        nt, ns = block[0], block[1]
-        if nt == 0:
-            data.extend(block[2:ns+1])
-            break
-        data.extend(block[2:])
-        t, sec = nt, ns
-    return match["name"], bytes(data)
+def extract_prg_with_c1541(img, wanted_name, suffix=".d64"):
+    fd, image_tmp = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    out_fd, out_tmp = tempfile.mkstemp(suffix=".prg")
+    os.close(out_fd)
+    os.remove(out_tmp)
+    try:
+        Path(image_tmp).write_bytes(img)
+        r = subprocess.run(["c1541", image_tmp, "-read", wanted_name, out_tmp], text=True, capture_output=True, timeout=60)
+        if r.returncode != 0 or not Path(out_tmp).exists():
+            raise RuntimeError((r.stderr or r.stdout or f"c1541 could not read {wanted_name!r}").strip())
+        return wanted_name, Path(out_tmp).read_bytes()
+    finally:
+        for p in (image_tmp, out_tmp):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
 
 
 def title_from_path(path):
     base = os.path.basename(path)
-    for ext in (".d64", ".prg", ".crt", ".tap"):
+    for ext in (".d64", ".d71", ".d81", ".g64", ".prg", ".crt", ".tap"):
         if base.lower().endswith(ext):
             base = base[:-len(ext)]
     return base.replace("_", " ").replace("-", " ").strip()
@@ -482,8 +470,29 @@ def unmount_image(host, drive="a"):
     return api_put(host, f"/v1/drives/{drive}:remove")
 
 
-def cold_boot(host):
+def clear_cartridge(host):
+    """Clear the configured cartridge/CRT slot so reset/reboot returns to a plain machine.
+
+    U2+ run_crt can leave a cartridge configured across resets. The config API
+    uses a per-setting endpoint with a value parameter.
+    """
+    return api_put(host, "/v1/configs/C64%20and%20Cartridge%20Settings/Cartridge", {"value": ""})
+
+
+def reboot_machine(host, clear_cart=True):
+    if clear_cart:
+        clear_cartridge(host)
+    return api_put(host, "/v1/machine:reboot")
+
+
+def reset_machine(host, clear_cart=True):
+    if clear_cart:
+        clear_cartridge(host)
     return api_put(host, "/v1/machine:reset")
+
+
+def cold_boot(host):
+    return reset_machine(host)
 
 
 def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
@@ -713,14 +722,16 @@ def inject_c128_keys(host, text, invert_case=True):
 
 
 def d64_single_prg(host, image_path):
-    """Return (name, prg_bytes) if a D64 has exactly one directory entry and it is a PRG."""
-    if not image_path.lower().endswith(".d64"):
+    """Return (name, prg_bytes) if a disk image has exactly one directory entry and it is a PRG."""
+    if not image_path.lower().endswith((".d64", ".d71", ".d81")):
         return None
     img = ftp_download(host, image_path)
-    entries = [f for f in d64_directory(img) if f.get("name")]
-    print(f"STEP D64 directory entries: {[(e['name'], e['type']) for e in entries]}")
+    suffix = Path(image_path).suffix.lower() or ".d64"
+    info = c1541_directory(img, suffix=suffix)
+    entries = [f for f in info["entries"] if f.get("name")]
+    print(f"STEP disk directory entries: {[(e['name'], e['type']) for e in entries]}")
     if len(entries) == 1 and entries[0]["type"] == "PRG":
-        return extract_prg_from_d64(img, entries[0]["name"])
+        return extract_prg_with_c1541(img, entries[0]["name"], suffix=suffix)
     return None
 
 
@@ -1292,36 +1303,15 @@ def run_launch_script(host, image_path, machine_mode, script_dir="scripts"):
 
 
 def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False):
-    """Cold boot, detect mode, optionally GO64, then DMA single PRG or mount/load/run.
+    """Cold boot, detect mode, optionally GO64, then mount/load/run a disk image.
 
     entry controls the LOAD target for disk mode. Blank means LOAD"*".
     skip_prehelp bypasses any pre-run help block and sends RUN normally.
+    Disk mode must always use the mounted-disk LOAD path, even when the image
+    contains a single PRG. Explicit prg mode is the only DMA/run_prg path.
     """
     target_mode = "c128" if str(target_mode).lower() in ("128", "c128") else "c64"
     print(f"STEP target_mode={target_mode} image={image_path} drive={drive}")
-
-    # Fast path: for C64-target D64s with exactly one PRG, skip mode probing and
-    # GO64 entirely. The Ultimate run_prg/DMA path handles the C64 launch itself.
-    single = None
-    if target_mode == "c64":
-        print("STEP pre-inspect image for single-file C64 DMA load")
-        single = d64_single_prg(host, image_path)
-        if single:
-            name, prg = single
-            load = prg[0] + 256 * prg[1] if len(prg) >= 2 else 0
-            print(f"STEP single PRG found: {name!r}, {len(prg)} bytes, load=${load:04x}")
-            print("STEP clean /Temp before DMA run_prg")
-            try:
-                clean_temp(host)
-            except Exception as e:
-                print(f"STEP clean temp warning: {e}")
-            print("STEP DMA run_prg directly; skipping unmount/cold boot/mode detection/GO64")
-            status, body = post_runner(host, "/v1/runners:run_prg", prg)
-            print(f"STEP run_prg response: HTTP {status} {body.strip()}")
-            run_launch_script(host, image_path, "c64")
-            print("STEP launch sequence complete")
-            return status, body
-        print("STEP not a single-PRG D64; will use boot/mount/LOAD flow")
 
     try:
         print("STEP unmount image")
@@ -1411,8 +1401,8 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
     lower = path.lower()
     if mode == "prg":
         blob = ftp_download(host, path)
-        if lower.endswith(".d64"):
-            name, blob = extract_prg_from_d64(blob, entry)
+        if lower.endswith((".d64", ".d71", ".d81")):
+            name, blob = extract_prg_with_c1541(blob, entry, suffix=Path(path).suffix.lower() or ".d64")
             print(f"Extracted {name!r}, {len(blob)} bytes")
         if not blob:
             raise RuntimeError(f"Downloaded PRG payload is 0 bytes: {path}")
@@ -1433,25 +1423,316 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
     raise RuntimeError(f"Unsupported launch mode {mode!r} for path {path!r}")
 
 
+def is_sqlite_path(path):
+    return str(path).lower().endswith((".db", ".sqlite", ".sqlite3"))
+
+
+def sqlite_connect(path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def ensure_lookup(conn, table, names=()):
+    conn.execute(f"CREATE TABLE IF NOT EXISTS {table} (pk_ID INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE)")
+    for name in names:
+        conn.execute(f"INSERT OR IGNORE INTO {table} (name) VALUES (?)", (name,))
+
+
+def ensure_file_type(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS FileType (
+            pk_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(FileType)")}
+    if "enabled" not in existing:
+        conn.execute("ALTER TABLE FileType ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
+    for name, enabled in (("d64", 1), ("d71", 1), ("d81", 1), ("prg", 1), ("crt", 1), ("g64", 0), ("tap", 0)):
+        conn.execute("INSERT OR IGNORE INTO FileType (name, enabled) VALUES (?, ?)", (name, enabled))
+        if enabled == 0:
+            conn.execute("UPDATE FileType SET enabled = 0 WHERE name = ?", (name,))
+
+
+def lookup_id(conn, table, name):
+    name = (name or "").strip()
+    if not name:
+        return None
+    conn.execute(f"INSERT OR IGNORE INTO {table} (name) VALUES (?)", (name,))
+    return conn.execute(f"SELECT pk_ID FROM {table} WHERE name = ?", (name,)).fetchone()[0]
+
+
+def ensure_rows_table(conn, fields=None):
+    ensure_lookup(conn, "Status", ["approved", "failed", "launched", "skipped"])
+    ensure_lookup(conn, "StorageStatus", ["present", "missing", "deleted", "returned"])
+    ensure_lookup(conn, "MachineMode", ["c64", "c128"])
+    ensure_file_type(conn)
+    ensure_lookup(conn, "LaunchMode", ["disk", "prg", "crt", "tap"])
+    conn.execute("CREATE TABLE IF NOT EXISTS Tag (pk_ID INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE)")
+    conn.execute("CREATE TABLE IF NOT EXISTS ScanPath (path TEXT PRIMARY KEY)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS Image (
+            pk_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL UNIQUE,
+            payload TEXT NOT NULL DEFAULT '',
+            entry TEXT NOT NULL DEFAULT '',
+            detail TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            quarantine_reason TEXT NOT NULL DEFAULT '',
+            deleted_reason TEXT NOT NULL DEFAULT '',
+            quarantined INTEGER NOT NULL DEFAULT 0,
+            fk_Status_ID INTEGER REFERENCES Status(pk_ID),
+            fk_StorageStatus_ID INTEGER REFERENCES StorageStatus(pk_ID),
+            fk_MachineMode_ID INTEGER REFERENCES MachineMode(pk_ID),
+            fk_FileType_ID INTEGER REFERENCES FileType(pk_ID),
+            fk_LaunchMode_ID INTEGER REFERENCES LaunchMode(pk_ID),
+            last_seen_at TEXT,
+            deleted_at TEXT,
+            reappeared_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ImageTag (
+            fk_Image_ID INTEGER NOT NULL REFERENCES Image(pk_ID) ON DELETE CASCADE,
+            fk_Tag_ID INTEGER NOT NULL REFERENCES Tag(pk_ID) ON DELETE CASCADE,
+            PRIMARY KEY (fk_Image_ID, fk_Tag_ID)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_title ON Image(title)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_path ON Image(path)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_payload ON Image(payload)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_Status ON Image(fk_Status_ID)")
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_Image_updated_at
+        AFTER UPDATE ON Image
+        FOR EACH ROW
+        WHEN NEW.updated_at = OLD.updated_at
+        BEGIN
+            UPDATE Image SET updated_at = CURRENT_TIMESTAMP WHERE pk_ID = NEW.pk_ID;
+        END
+        """
+    )
+
+    # One-time migration from the first flat prototype table, if present.
+    old_game_rows = conn.execute("SELECT type FROM sqlite_master WHERE name = 'game_rows'").fetchone()
+    if old_game_rows and old_game_rows[0] == "table" and conn.execute("SELECT COUNT(*) FROM Image").fetchone()[0] == 0:
+        for r in conn.execute("SELECT * FROM game_rows").fetchall():
+            d = dict(r)
+            file_type = d.get("file_type") or d.get("type")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO Image (
+                    title, path, payload, entry, detail, notes,
+                    quarantined, quarantine_reason, deleted_reason,
+                    fk_Status_ID, fk_StorageStatus_ID, fk_MachineMode_ID,
+                    fk_FileType_ID, fk_LaunchMode_ID
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    d.get("title", ""), d.get("path", ""), d.get("payload", ""),
+                    d.get("entry", ""), d.get("detail", ""), d.get("notes", ""),
+                    1 if str(d.get("quarantined", "")).lower() in ("1", "true", "yes", "y") else 0,
+                    d.get("quarantine_reason", ""), d.get("deleted_reason", ""),
+                    lookup_id(conn, "Status", d.get("status", "")),
+                    lookup_id(conn, "StorageStatus", d.get("storage_status", "present") or "present"),
+                    lookup_id(conn, "MachineMode", d.get("machine_mode", "")),
+                    lookup_id(conn, "FileType", file_type),
+                    lookup_id(conn, "LaunchMode", d.get("mode", "")),
+                ),
+            )
+
+    for legacy in ("image_rows", "game_rows"):
+        obj = conn.execute("SELECT type FROM sqlite_master WHERE name = ?", (legacy,)).fetchone()
+        if obj and obj[0] == "table":
+            conn.execute(f"DROP TABLE {legacy}")
+    conn.execute("DROP VIEW IF EXISTS image_rows")
+    conn.execute("DROP VIEW IF EXISTS game_rows")
+    view_sql = """
+        CREATE VIEW image_rows AS
+        SELECT
+            i.pk_ID AS id,
+            i.title,
+            i.path,
+            i.payload,
+            lm.name AS mode,
+            i.entry,
+            mm.name AS machine_mode,
+            ft.name AS file_type,
+            ft.name AS type,
+            COALESCE(ft.enabled, 1) AS file_type_enabled,
+            i.detail,
+            s.name AS status,
+            ss.name AS storage_status,
+            i.quarantined,
+            i.quarantine_reason,
+            i.deleted_reason,
+            i.notes,
+            i.created_at,
+            i.updated_at
+        FROM Image i
+        LEFT JOIN Status s ON s.pk_ID = i.fk_Status_ID
+        LEFT JOIN StorageStatus ss ON ss.pk_ID = i.fk_StorageStatus_ID
+        LEFT JOIN MachineMode mm ON mm.pk_ID = i.fk_MachineMode_ID
+        LEFT JOIN FileType ft ON ft.pk_ID = i.fk_FileType_ID
+        LEFT JOIN LaunchMode lm ON lm.pk_ID = i.fk_LaunchMode_ID
+    """
+    conn.execute(view_sql)
+
+
+def read_sqlite_rows(path):
+    with sqlite_connect(path) as conn:
+        ensure_rows_table(conn)
+        rows = conn.execute("SELECT * FROM image_rows ORDER BY id").fetchall()
+        return [{k: (row[k] if row[k] is not None else "") for k in row.keys() if k not in ("id", "created_at", "updated_at")} for row in rows]
+
+
+def write_sqlite_rows(path, rows, fields):
+    with sqlite_connect(path) as conn:
+        ensure_rows_table(conn, fields)
+        conn.execute("DELETE FROM Image")
+        for r in rows:
+            file_type = r.get("file_type") or r.get("type")
+            vals = {
+                "title": r.get("title", ""),
+                "path": r.get("path", ""),
+                "payload": r.get("payload", ""),
+                "entry": r.get("entry", ""),
+                "detail": r.get("detail", ""),
+                "notes": r.get("notes", ""),
+                "quarantine_reason": r.get("quarantine_reason", ""),
+                "deleted_reason": r.get("deleted_reason", ""),
+                "quarantined": 1 if str(r.get("quarantined", "")).lower() in ("1", "true", "yes", "y") else 0,
+                "fk_Status_ID": lookup_id(conn, "Status", r.get("status", "")),
+                "fk_StorageStatus_ID": lookup_id(conn, "StorageStatus", r.get("storage_status", "present") or "present"),
+                "fk_MachineMode_ID": lookup_id(conn, "MachineMode", r.get("machine_mode", "")),
+                "fk_FileType_ID": lookup_id(conn, "FileType", file_type),
+                "fk_LaunchMode_ID": lookup_id(conn, "LaunchMode", r.get("mode", "")),
+            }
+            columns = ", ".join(vals)
+            placeholders = ", ".join("?" for _ in vals)
+            conn.execute(f"INSERT INTO Image ({columns}) VALUES ({placeholders})", list(vals.values()))
+
+
+def import_scan_paths(db_path, paths):
+    """Replace ScanPath contents with the latest full inventory path list.
+
+    Uses sqlite3 CLI .import when available, falling back to Python executemany.
+    """
+    paths = [p for p in paths if p]
+    with sqlite_connect(db_path) as conn:
+        ensure_rows_table(conn)
+        conn.execute("DELETE FROM ScanPath")
+
+    sqlite3_bin = shutil.which("sqlite3")
+    shm = Path("/dev/shm")
+    tmpdir = shm if shm.is_dir() and os.access(shm, os.W_OK) else Path(tempfile.gettempdir())
+    scan_file = tmpdir / f"u2_scan_paths_{os.getpid()}.txt"
+    try:
+        scan_file.write_text("".join(p.replace("\n", " ") + "\n" for p in paths))
+        if sqlite3_bin:
+            script = f"""
+.bail on
+.mode tabs
+.import {scan_file} ScanPath
+"""
+            try:
+                subprocess.run([sqlite3_bin, str(db_path)], input=script, text=True, check=True)
+                return
+            except subprocess.CalledProcessError:
+                pass
+        with sqlite_connect(db_path) as conn:
+            conn.execute("PRAGMA synchronous=OFF")
+            conn.executemany("INSERT OR IGNORE INTO ScanPath(path) VALUES (?)", ((p,) for p in paths))
+    finally:
+        try:
+            scan_file.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def reconcile_scan_paths(db_path):
+    """Update storage status from ScanPath vs Image after a full scan."""
+    with sqlite_connect(db_path) as conn:
+        ensure_rows_table(conn)
+        present = lookup_id(conn, "StorageStatus", "present")
+        missing = lookup_id(conn, "StorageStatus", "missing")
+        deleted = lookup_id(conn, "StorageStatus", "deleted")
+        returned = lookup_id(conn, "StorageStatus", "returned")
+        conn.execute(
+            "UPDATE Image SET fk_StorageStatus_ID = ? WHERE fk_StorageStatus_ID = ? AND path IN (SELECT path FROM ScanPath)",
+            (present, missing),
+        )
+        conn.execute(
+            "UPDATE Image SET fk_StorageStatus_ID = ? WHERE fk_StorageStatus_ID = ? AND path IN (SELECT path FROM ScanPath)",
+            (returned, deleted),
+        )
+        conn.execute(
+            "UPDATE Image SET fk_StorageStatus_ID = ? WHERE fk_StorageStatus_ID = ? AND path NOT IN (SELECT path FROM ScanPath)",
+            (missing, present),
+        )
+        return {
+            "scan_paths": conn.execute("SELECT COUNT(*) FROM ScanPath").fetchone()[0],
+            "new_paths": conn.execute("SELECT COUNT(*) FROM ScanPath s LEFT JOIN Image i ON i.path = s.path WHERE i.path IS NULL").fetchone()[0],
+            "missing_images": conn.execute("SELECT COUNT(*) FROM Image WHERE fk_StorageStatus_ID = ?", (missing,)).fetchone()[0],
+            "returned_images": conn.execute("SELECT COUNT(*) FROM Image WHERE fk_StorageStatus_ID = ?", (returned,)).fetchone()[0],
+        }
+
+
+def file_type_names(db_path="curator.db", enabled_only=False):
+    if is_sqlite_path(db_path):
+        with sqlite_connect(db_path) as conn:
+            ensure_rows_table(conn)
+            sql = "SELECT name FROM FileType"
+            if enabled_only:
+                sql += " WHERE enabled = 1"
+            sql += " ORDER BY name"
+            return [r[0] for r in conn.execute(sql)]
+    names = ["crt", "d64", "d71", "d81", "g64", "prg", "tap"]
+    return [n for n in names if n not in ("g64", "tap")] if enabled_only else names
+
+
+def enabled_file_type_names(db_path="curator.db"):
+    return file_type_names(db_path, enabled_only=True)
+
+
 def table_delimiter(path):
-    # Project convention: .tsv/.tab are tab-delimited "CSV database" files.
-    # .csv remains comma-delimited for compatibility with spreadsheet imports.
+    # Legacy import/export: .tsv/.tab are tab-delimited, .csv is comma-delimited.
     lower = str(path).lower()
     return "\t" if lower.endswith((".tsv", ".tab")) else ","
 
 
 def read_csv(path):
+    if is_sqlite_path(path):
+        return read_sqlite_rows(path)
     with open(path, newline="") as f:
         sample = f.read(4096)
         f.seek(0)
         # Prefer extension, but auto-detect tab files with .csv names too.
         delim = table_delimiter(path)
-        if delim == "," and "\t" in sample.splitlines()[0] and "," not in sample.splitlines()[0]:
+        first = sample.splitlines()[0] if sample.splitlines() else ""
+        if delim == "," and "\t" in first and "," not in first:
             delim = "\t"
         return list(csv.DictReader(f, delimiter=delim))
 
 
 def write_csv(path, rows, fields):
+    if is_sqlite_path(path):
+        write_sqlite_rows(path, rows, fields)
+        return
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, delimiter=table_delimiter(path))
         w.writeheader()
