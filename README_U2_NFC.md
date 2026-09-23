@@ -105,38 +105,49 @@ For `d64` fallback behavior:
 sudo ./u2_nfc_launcher.py --ultimate auto --d64-as-prg-loader
 ```
 
+## Raspberry Pi / Debian setup
+
+On a fresh Raspberry Pi OS / Debian install, run:
+
+```bash
+scripts/setup-pi.sh
+```
+
+This installs Python, SQLite, VICE `c1541` disk-image tools, USB utilities, Python requirements, and adds the current user to `dialout` for NFC serial access. Log out/in or reboot if the script adds you to `dialout`.
+
+Python package dependencies are listed in `requirements.txt`; currently the runtime uses only the Python standard library.
+
 ## New rough-draft workflow scripts
 
 ### 1. Inventory the Ultimate USB
 
 ```bash
-./u2_inventory.py --ultimate auto --root /Usb0/C64 --out inventory.csv
+./u2_inventory.py --ultimate auto
 ```
 
-This recursively scans `/Usb0/C64` to limited depth and writes likely launchable files to `inventory.csv`.
+This recursively scans the Ultimate USB root `/` to limited depth and writes likely launchable rows to `curator.db`. Normal scans are path-only and fast; they do not download every disk image.
 
 It looks for:
 
-- `.d64`
+- `.d64`, `.d71`, `.d81`
+- `.g64`, `.tap` as imported-but-disabled/unsupported types
 - `.prg`
 - `.crt`
 
-For D64s, it downloads the image read-only over FTP, reads the directory, and suggests a launch mode/entry:
+By default, disk images are not deep-inspected. To explicitly download D64/D71/D81 images and summarize their directories with `c1541`, use:
 
-- single PRG inside D64 -> `mode=prg`, `entry=<that prg>`
-- multiple PRGs -> `mode=d64`, `entry=<first prg>`
-- CRT -> `mode=crt`
-
-Output columns include:
-
-```csv
-title,path,file_type,mode,entry,payload,detail
+```bash
+./u2_inventory.py --ultimate auto --inspect-disks
 ```
+
+With `--inspect-disks`, single-PRG disk images can be suggested as `mode=prg` with `entry=<that prg>`; otherwise disks default to `mode=disk`.
+
+Rows are stored in normalized SQLite tables and exposed through the `image_rows` view. Legacy CSV/TSV files can still be read or written by explicitly passing a `.csv`/`.tsv` path.
 
 ### 2. Browse, test, and approve games in one TUI
 
 ```bash
-./u2_curate_tui.py inventory.csv --ultimate auto --out approved_games.csv
+./u2_curate_tui.py --ultimate auto
 ```
 
 Controls:
@@ -161,16 +172,16 @@ Intended process:
 5. Move on.
 6. Quit/save when done.
 
-This writes only approved games to:
+This persists curated state to:
 
 ```text
-approved_games.csv
+curator.db
 ```
 
 ### 3. Export labels for printing
 
 ```bash
-./u2_export_labels.py approved_games.csv --out labels.csv
+./u2_export_labels.py curator.db --out labels.csv
 ```
 
 This writes a CSV containing only:
@@ -184,12 +195,12 @@ Monopoly
 
 Use this in Excel/LibreOffice/label software. The physical labels can just be the game names.
 
-Important: keep the physical cards in the same order as `approved_games.csv` / `labels.csv` while sticking labels to cards.
+Important: keep the physical cards in the same order as `curator.db` export / `labels.csv` while sticking labels to cards.
 
 ### 4. Guided card writing
 
 ```bash
-sudo ./u2_write_cards_from_manifest.py approved_games.csv --ultimate auto
+sudo ./u2_write_cards_from_manifest.py curator.db --ultimate auto
 ```
 
 For each approved game, it shows the title and payload, optionally test-launches it again, then asks you to place the matching labeled NFC card on the reader. It calls `nfc_write_text.py` to write and verify the NFC card.
@@ -197,25 +208,25 @@ For each approved game, it shows the title and payload, optionally test-launches
 If you do not want the extra launch test during writing:
 
 ```bash
-sudo ./u2_write_cards_from_manifest.py approved_games.csv --skip-launch-test
+sudo ./u2_write_cards_from_manifest.py curator.db --skip-launch-test
 ```
 
 ## Typical end-to-end flow
 
 ```bash
-# 1. Scan Ultimate USB for games
-./u2_inventory.py --ultimate auto --root /Usb0/C64 --out inventory.csv
+# 1. Scan Ultimate USB for images into curator.db
+./u2_inventory.py --ultimate auto
 
 # 2. Browse, test launch, and approve games
-./u2_curate_tui.py inventory.csv --ultimate auto --out approved_games.csv
+./u2_curate_tui.py --ultimate auto
 
 # 3. Export title-only labels
-./u2_export_labels.py approved_games.csv --out labels.csv
+./u2_export_labels.py curator.db --out labels.csv
 
 # 4. Print labels.csv, cut labels, stick them to NFC cards in order
 
 # 5. Program cards in that same order
-sudo ./u2_write_cards_from_manifest.py approved_games.csv --ultimate auto
+sudo ./u2_write_cards_from_manifest.py curator.db --ultimate auto
 
 # 6. Run the live NFC launcher
 sudo ./u2_nfc_launcher.py --ultimate auto --d64-as-prg-loader

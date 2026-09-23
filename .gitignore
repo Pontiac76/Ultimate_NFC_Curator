@@ -12,6 +12,10 @@ u2_hosts.txt
 
 # Runtime/local state
 .u2_state.json
+curator.db
+curator.db.*
+curator.db-shm
+curator.db-wal
 *.log
 
 # Temporary/editor files
@@ -47,3 +51,4 @@ rest_key_game_candidates.csv
 rest_key_game_titles*.txt
 screen_dump_*.txt
 modplayer_screen_ansi*.txt
+curator

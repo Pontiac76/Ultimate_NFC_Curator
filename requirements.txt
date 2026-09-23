@@ -1,0 +1,6 @@
+# Python package requirements for Ultimate NFC Curator
+#
+# Runtime code currently uses only the Python standard library.
+# This file exists so bootstrap tooling can consistently run:
+#   python3 -m pip install -r requirements.txt
+# without pulling third-party packages.

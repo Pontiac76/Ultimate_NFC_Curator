@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guided writer for approved_games.csv. Uses nfc_write_text.py for each card."""
+"""Guided writer for curated launch rows. Uses nfc_write_text.py for each card."""
 
 import argparse
 import subprocess
@@ -9,16 +9,16 @@ from u2_common import *
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("manifest", nargs="?", default="approved_games.csv")
+    ap.add_argument("manifest", nargs="?", default="curator.db")
     ap.add_argument("--device", default="/dev/ttyUSB0")
     ap.add_argument("--ultimate", default="auto")
     ap.add_argument("--skip-launch-test", action="store_true")
     ap.add_argument("--writer", default="./nfc_write_text.py")
     args = ap.parse_args()
 
-    rows = read_csv(args.manifest)
+    rows = [r for r in read_csv(args.manifest) if r.get("status") == "approved"]
     if not rows:
-        raise SystemExit(f"No rows in {args.manifest}")
+        raise SystemExit(f"No approved rows in {args.manifest}")
     host = None if args.skip_launch_test else (discover_ultimate() if args.ultimate == "auto" else args.ultimate)
 
     print(f"Loaded {len(rows)} approved games from {args.manifest}")

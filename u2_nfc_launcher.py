@@ -24,10 +24,11 @@ import urllib.parse
 import urllib.request
 
 try:
-    from u2_common import discover_ultimate, ftp_download as common_ftp_download
+    from u2_common import discover_ultimate, ftp_download as common_ftp_download, extract_prg_with_c1541
 except Exception:
     discover_ultimate = None
     common_ftp_download = None
+    extract_prg_with_c1541 = None
 
 ACK = b"\x00\x00\xff\x00\xff\x00"
 HOST_TFI = 0xD4
@@ -230,66 +231,10 @@ def download_from_ultimate(host, ultimate_path):
         return r.read()
 
 
-def petscii_name(bs):
-    bs = bytes(bs).split(b"\xa0")[0]
-    out = ""
-    for b in bs:
-        if 65 <= b <= 90:
-            out += chr(b).lower()
-        elif 193 <= b <= 218:
-            out += chr(b - 128).lower()
-        elif 32 <= b <= 126:
-            out += chr(b)
-    return out.strip()
-
-
-def extract_prg_from_d64(img, wanted_name):
-    wanted = wanted_name.strip().lower()
-    spt = [0] + [21] * 17 + [19] * 7 + [18] * 6 + [17] * 5
-    offsets = [0]
-    pos = 0
-    for track in range(1, 36):
-        offsets.append(pos)
-        pos += spt[track] * 256
-
-    def tso(track, sector):
-        return offsets[track] + sector * 256
-
-    start = None
-    t, sec = 18, 1
-    seen = set()
-    available = []
-    while t and (t, sec) not in seen:
-        seen.add((t, sec))
-        block = img[tso(t, sec) : tso(t, sec) + 256]
-        for i in range(8):
-            e = block[2 + i * 32 : 2 + (i + 1) * 32]
-            if e[0] and (e[0] & 7) == 2:
-                nm = petscii_name(e[3:19])
-                available.append(nm)
-                if nm.lower() == wanted:
-                    start = (e[1], e[2], nm)
-                    break
-        if start:
-            break
-        t, sec = block[0], block[1]
-
-    if not start:
-        raise RuntimeError(f"PRG {wanted_name!r} not found in D64. Available PRGs: {available}")
-
-    data = bytearray()
-    t, sec, actual_name = start
-    seen = set()
-    while t and (t, sec) not in seen:
-        seen.add((t, sec))
-        block = img[tso(t, sec) : tso(t, sec) + 256]
-        nt, ns = block[0], block[1]
-        if nt == 0:
-            data.extend(block[2 : ns + 1])
-            break
-        data.extend(block[2:])
-        t, sec = nt, ns
-    return actual_name, bytes(data)
+def extract_prg_from_disk_image(img, wanted_name, suffix=".d64"):
+    if not extract_prg_with_c1541:
+        raise RuntimeError("c1541 extraction unavailable; install VICE or use u2_common.py")
+    return extract_prg_with_c1541(img, wanted_name, suffix=suffix)
 
 
 def post_to_runner(host, endpoint, body):
@@ -323,10 +268,10 @@ def launch(host, text, allow_d64_prg_loader=False):
 
     if mode == "prg":
         blob = download_from_ultimate(host, path)
-        if path.lower().endswith(".d64"):
+        if path.lower().endswith((".d64", ".d71", ".d81")):
             if not entry:
-                raise RuntimeError("prg mode with a D64 requires #entry")
-            actual, prg = extract_prg_from_d64(blob, entry)
+                raise RuntimeError("prg mode with a disk image requires #entry")
+            actual, prg = extract_prg_from_disk_image(blob, entry, suffix=os.path.splitext(path)[1].lower() or ".d64")
             load = prg[0] + 256 * prg[1] if len(prg) >= 2 else None
             print(f"Extracted PRG {actual!r}: {len(prg)} bytes, load=${load:04x}")
             status, body = post_to_runner(host, "/v1/runners:run_prg", prg)
@@ -343,23 +288,23 @@ def launch(host, text, allow_d64_prg_loader=False):
         print(f"Ultimate response: HTTP {status} {body.strip()}")
         return
 
-    if mode == "d64":
+    if mode in ("d64", "disk"):
         if not allow_d64_prg_loader:
             raise RuntimeError(
-                "d64 mode needs a confirmed Ultimate disk-mount API. "
+                "disk mode needs a confirmed Ultimate disk-mount API. "
                 "For a one-file/loader demo you can rerun with --d64-as-prg-loader, "
-                "but multi-file games may fail after the loader starts."
+                "but multi-file images may fail after the loader starts."
             )
-        if not path.lower().endswith(".d64"):
-            raise RuntimeError(f"{path} is not a D64; this needs real disk-image mounting support")
+        if not path.lower().endswith((".d64", ".d71", ".d81")):
+            raise RuntimeError(f"{path} is not a supported disk image for PRG-loader fallback")
         if not entry:
             raise RuntimeError("--d64-as-prg-loader requires #entry")
         blob = download_from_ultimate(host, path)
-        actual, prg = extract_prg_from_d64(blob, entry)
+        actual, prg = extract_prg_from_disk_image(blob, entry, suffix=os.path.splitext(path)[1].lower() or ".d64")
         if not prg:
             raise RuntimeError(f"Extracted PRG is 0 bytes: {entry}")
         load = prg[0] + 256 * prg[1] if len(prg) >= 2 else None
-        print(f"D64 fallback: extracted loader {actual!r}: {len(prg)} bytes, load=${load:04x}")
+        print(f"Disk fallback: extracted loader {actual!r}: {len(prg)} bytes, load=${load:04x}")
         status, body = post_to_runner(host, "/v1/runners:run_prg", prg)
         print(f"Ultimate response: HTTP {status} {body.strip()}")
         return

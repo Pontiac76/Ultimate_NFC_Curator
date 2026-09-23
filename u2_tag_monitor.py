@@ -4,7 +4,7 @@
 Reads NDEF text tags. Preferred card payload is path-only:
   U2+:/C64/Games/Ghostbusters/ghostbusters.d64
 
-Launch settings come from curator_state.tsv / approved_games.tsv when present.
+Launch settings come from curator.db when present; legacy TSV/CSV manifests are still readable.
 Press q (or Ctrl-C) to exit when run interactively.
 """
 
@@ -221,7 +221,7 @@ def main():
     ap.add_argument("--device", "-d", default="/dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200, choices=[9600, 19200, 38400, 57600, 115200])
     ap.add_argument("--ultimate", default="auto")
-    ap.add_argument("--state", action="append", default=["curator_state.tsv", "approved_games.tsv"], help="TSV launch DB; may be repeated")
+    ap.add_argument("--state", action="append", default=["curator.db"], help="SQLite launch DB or legacy TSV/CSV manifest; may be repeated")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--no-launch", action="store_true", help="read/print tag contents but do not launch anything")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI color/status output")
