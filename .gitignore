@@ -52,3 +52,6 @@ rest_key_game_titles*.txt
 screen_dump_*.txt
 modplayer_screen_ansi*.txt
 curator
+
+# Local merge/conversion logs
+merge_logs/
