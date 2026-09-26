@@ -3,7 +3,9 @@
 
 import csv
 import ftplib
+import hashlib
 import ipaddress
+import io
 import json
 import os
 import socket
@@ -17,7 +19,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STATE_FILE = Path(".u2_state.json")
@@ -270,6 +272,64 @@ def ftp_download(host, ultimate_path):
     raise last_err
 
 
+def ftp_upload(host, ultimate_path, data):
+    """Upload bytes to Ultimate FTP, trying Usb0/Usb1 fallback. Refuses overwrite by caller convention."""
+    last_err = None
+    parent = str(PurePosixPath(ultimate_path).parent)
+    name = PurePosixPath(ultimate_path).name
+    for path in candidate_usb_paths(ultimate_path):
+        ftp = ftplib.FTP(host, timeout=30)
+        try:
+            ftp.login("anonymous", "ftp@example.com")
+            ftp.cwd(str(PurePosixPath(path).parent))
+            bio = io.BytesIO(data)
+            ftp.storbinary("STOR " + PurePosixPath(path).name, bio)
+            ftp.quit()
+            note_usb_success(ultimate_path, path)
+            return True
+        except Exception as e:
+            last_err = e
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+    raise last_err
+
+
+def ftp_exists(host, ultimate_path):
+    try:
+        ftp_size(host, ultimate_path)
+        return True
+    except Exception:
+        return False
+
+
+def ftp_delete(host, ultimate_path):
+    """Delete a file from Ultimate FTP, trying Usb0/Usb1 fallback.
+
+    Missing files are treated as success; caller can mark local DB state deleted.
+    """
+    last_err = None
+    for path in candidate_usb_paths(ultimate_path):
+        ftp = ftplib.FTP(host, timeout=15)
+        try:
+            ftp.login("anonymous", "ftp@example.com")
+            ftp.delete(path)
+            ftp.quit()
+            note_usb_success(ultimate_path, path)
+            return True
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+            if "550" in msg or "not found" in msg or "no such" in msg:
+                return True
+    raise last_err
+
+
 def ftp_size(host, ultimate_path):
     """Return size for a file on Ultimate FTP, trying Usb0/Usb1 fallback."""
     last_err = None
@@ -365,14 +425,21 @@ def c1541_directory_from_file(image_file):
     disk_id = ""
     blocks_free = None
     for line in r.stdout.splitlines():
+        # Parse file entries before the disk header. DEL entries commonly have
+        # zero blocks, e.g. 0 "banner text" del, and the old header-first parser
+        # swallowed those as fake disk labels.
+        m = re.match(r'\s*(\d+)\s+"([^"]+)"\s+(del|seq|prg|usr|rel)\b', line, re.I)
+        if m:
+            # Preserve CBM filename exactly as c1541 reports it inside quotes.
+            # Trailing spaces/control-ish characters can be significant; stripping
+            # made entries appear as e.g. "xx" in the TUI/log while c1541 could
+            # not later address the real on-disk name.
+            entries.append({"blocks": int(m.group(1)), "name": m.group(2), "type": m.group(3).upper()})
+            continue
         m = re.match(r'\s*0\s+"([^"]*)"\s*(.*)$', line)
         if m:
             disk_name = m.group(1).strip()
             disk_id = m.group(2).strip()
-            continue
-        m = re.match(r'\s*(\d+)\s+"([^"]+)"\s+(\S+)', line)
-        if m:
-            entries.append({"blocks": int(m.group(1)), "name": m.group(2).strip(), "type": m.group(3).upper()})
             continue
         m = re.match(r'\s*(\d+)\s+blocks free\.', line, re.I)
         if m:
@@ -391,6 +458,233 @@ def c1541_directory(img, suffix=".d64"):
             os.remove(tmp)
         except FileNotFoundError:
             pass
+
+
+def convert_disk_image_with_c1541(image_bytes, source_suffix, target_type):
+    """Best-effort D64/D71 -> larger image conversion using c1541 extract/write."""
+    target_type = target_type.lower().lstrip(".")
+    source_suffix = source_suffix if str(source_suffix).startswith(".") else "." + str(source_suffix)
+    if target_type not in ("d71", "d81"):
+        raise ValueError(f"unsupported target image type: {target_type}")
+    if not c1541_available():
+        raise RuntimeError("c1541 is not installed; run scripts/setup-pi.sh or install VICE")
+    with tempfile.TemporaryDirectory(prefix="u2_convert_") as td:
+        work = Path(td)
+        src = work / ("source" + source_suffix)
+        dst = work / ("target." + target_type)
+        files_dir = work / "files"
+        files_dir.mkdir()
+        src.write_bytes(image_bytes)
+        info = c1541_directory_from_file(src)
+        disk_name = (info.get("disk_name") or "converted")[:16]
+        disk_id = (info.get("disk_id") or "u2").split()[0][:5] or "u2"
+        # Use c1541's drive-to-drive copy instead of host extract/write so file
+        # types (PRG/SEQ/USR/REL, and DEL if c1541 can address it) are preserved
+        # where c1541 supports them. Empty source images are valid; formatting the
+        # target is enough in that case.
+        entries = [e for e in info.get("entries", []) if e.get("name")]
+        r = subprocess.run([
+            "c1541", "-attach", str(src), "8", "-format", f"{disk_name},{disk_id}", target_type, str(dst), "9"
+        ], text=True, capture_output=True, timeout=120)
+        if r.returncode != 0 or not dst.exists():
+            raise RuntimeError((r.stderr or r.stdout or f"c1541 could not create {target_type.upper()}").strip())
+        copy_warnings = []
+        for entry in entries:
+            name = entry.get("name", "")[:16]
+            typ = entry.get("type", "")
+            src_spec = _c1541_entry_spec(name, typ)
+            dst_spec = _c1541_entry_spec(name, typ)
+            r = subprocess.run([
+                "c1541", "-attach", str(src), "8", "-attach", str(dst), "9", "-copy", f"@8:{src_spec}", f"@9:{dst_spec}"
+            ], text=True, capture_output=True, timeout=120)
+            if r.returncode != 0:
+                # Match merge behavior: if direct image-to-image copy fails,
+                # attempt host read/write fallback for non-DEL entries. This
+                # handles some odd but readable names/types.
+                blob = _c1541_read_entry_bytes(src, name, typ)
+                if blob is not None and typ != "DEL":
+                    tmp_fd, tmp_name = tempfile.mkstemp(prefix="u2_convert_fallback_")
+                    os.close(tmp_fd)
+                    try:
+                        Path(tmp_name).write_bytes(blob)
+                        wr = subprocess.run(["c1541", "-attach", str(dst), "9", "-write", tmp_name, dst_spec], text=True, capture_output=True, timeout=120)
+                        if wr.returncode == 0:
+                            copy_warnings.append(f"Copied via read/write fallback after c1541 copy failed: {name}")
+                            continue
+                    finally:
+                        try:
+                            os.remove(tmp_name)
+                        except FileNotFoundError:
+                            pass
+                copy_warnings.append(f"Skipped unreadable/copy-failed {typ or 'file'} {name!r}")
+                continue
+        return dst.read_bytes()
+
+
+def _c1541_entry_spec(entry_name, entry_type=None):
+    if entry_type:
+        t = str(entry_type).lower()[:1]
+        if t in ("p", "s", "u", "r", "d"):
+            return f"{entry_name},{t}"
+    return entry_name
+
+
+def _c1541_read_entry_bytes(image_path, entry_name, entry_type=None):
+    out = Path(tempfile.mktemp(prefix="u2_entry_"))
+    try:
+        r = subprocess.run(["c1541", str(image_path), "-read", _c1541_entry_spec(entry_name, entry_type), str(out)], text=True, capture_output=True, timeout=60)
+        if r.returncode != 0 or not out.exists():
+            return None
+        return out.read_bytes()
+    finally:
+        try:
+            out.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def merge_disk_images_with_c1541(sources, target_type, disk_name=None):
+    """Best-effort merge of disk images into D64/D71/D81.
+
+    sources: [{"name": display/source filename, "suffix": ".d64", "bytes": b"..."}]
+    Returns (image_bytes, report_dict). Duplicate internal filenames are first-wins;
+    identical byte hashes are skipped silently, differing duplicates are warned.
+    """
+    target_type = target_type.lower().lstrip(".")
+    if target_type not in ("d64", "d71", "d81"):
+        raise ValueError(f"unsupported target image type: {target_type}")
+    if not c1541_available():
+        raise RuntimeError("c1541 is not installed; run scripts/setup-pi.sh or install VICE")
+    with tempfile.TemporaryDirectory(prefix="u2_merge_") as td:
+        work = Path(td)
+        dst = work / ("merged." + target_type)
+        seen = {}
+        warnings = []
+        copied = []
+        transcript = []
+        required_blocks = 0
+        disk_id = "u2"
+        if not disk_name and sources:
+            first_suffix = sources[0].get("suffix") or ".d64"
+            try:
+                first_info = c1541_directory(sources[0]["bytes"], first_suffix)
+                disk_name = first_info.get("disk_name") or "merged"
+                disk_id = (first_info.get("disk_id") or "u2").split()[0] or "u2"
+            except Exception:
+                disk_name = "merged"
+        elif not disk_name:
+            disk_name = "merged"
+        format_arg = f"{disk_name[:16]},{disk_id[:5]}"
+        r = subprocess.run(["c1541", "-format", format_arg, target_type, str(dst)], text=True, capture_output=True, timeout=120)
+        transcript.append("$ " + " ".join(["c1541", "-format", format_arg, target_type, str(dst)]))
+        if r.stdout:
+            transcript.append(r.stdout.rstrip())
+        if r.stderr:
+            transcript.append("[stderr]\n" + r.stderr.rstrip())
+        if r.returncode != 0 or not dst.exists():
+            raise RuntimeError((r.stderr or r.stdout or f"c1541 could not create {target_type.upper()}").strip())
+        for si, source in enumerate(sources):
+            suffix = source.get("suffix") or ".d64"
+            if not suffix.startswith("."):
+                suffix = "." + suffix
+            src = work / f"source{si}{suffix}"
+            src.write_bytes(source["bytes"])
+            info = c1541_directory_from_file(src)
+            for entry in info.get("entries", []):
+                name = entry.get("name", "")[:16]
+                if not name:
+                    continue
+                typ = entry.get("type", "")
+                blocks = int(entry.get("blocks") or 0)
+                blob = _c1541_read_entry_bytes(src, name, typ)
+                digest = hashlib.sha256(blob).hexdigest() if blob is not None else None
+                prior = seen.get(name)
+                if prior:
+                    if prior["type"] == typ and prior.get("digest") and digest and prior["digest"] == digest:
+                        continue
+                    if prior["type"] == typ and prior["blocks"] == blocks and not prior.get("digest") and digest is None:
+                        warnings.append(f'Duplicate same size but unreadable for hash; skipped "{name}" from {source.get("name", "source image")}')
+                    else:
+                        warnings.append(f'Duplicate differs; skipped "{name}" from {source.get("name", "source image")}')
+                    continue
+                transcript.append(f'copy entry: name={name!r} type={typ} blocks={blocks} source={source.get("name", "source image")}')
+                src_spec = _c1541_entry_spec(name, typ)
+                dst_spec = _c1541_entry_spec(name, typ)
+                cmd = ["c1541", "-attach", str(src), "8", "-attach", str(dst), "9", "-copy", f"@8:{src_spec}", f"@9:{dst_spec}"]
+                r = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
+                transcript.append("$ " + " ".join(cmd))
+                if r.stdout:
+                    transcript.append(r.stdout.rstrip())
+                if r.stderr:
+                    transcript.append("[stderr]\n" + r.stderr.rstrip())
+                if r.returncode != 0:
+                    reason = (r.stderr or r.stdout or "c1541 copy failed").strip().replace("\n", " ")
+                    # Fallback: some odd but readable entries (for example a file
+                    # named "................") may fail image-to-image copy but can
+                    # still be read to host bytes and written back by type.
+                    blob = _c1541_read_entry_bytes(src, name, typ)
+                    if blob is not None and typ != "DEL":
+                        tmp_fd, tmp_name = tempfile.mkstemp(prefix="u2_copy_fallback_")
+                        os.close(tmp_fd)
+                        try:
+                            Path(tmp_name).write_bytes(blob)
+                            write_cmd = ["c1541", "-attach", str(dst), "9", "-write", tmp_name, _c1541_entry_spec(name, typ)]
+                            wr = subprocess.run(write_cmd, text=True, capture_output=True, timeout=120)
+                            transcript.append("$ " + " ".join(write_cmd))
+                            if wr.stdout:
+                                transcript.append(wr.stdout.rstrip())
+                            if wr.stderr:
+                                transcript.append("[stderr]\n" + wr.stderr.rstrip())
+                            if wr.returncode == 0:
+                                warnings.append(f'Copied via read/write fallback after c1541 copy failed: "{name}" from {source.get("name", "source image")}')
+                                seen[name] = {"type": typ, "blocks": blocks, "digest": digest, "source": source.get("name", "")}
+                                copied.append(name)
+                                required_blocks += blocks
+                                continue
+                            reason += " ; fallback write failed: " + (wr.stderr or wr.stdout or "unknown").strip().replace("\n", " ")
+                        finally:
+                            try:
+                                os.remove(tmp_name)
+                            except FileNotFoundError:
+                                pass
+                    warnings.append(f'Skipped unreadable/copy-failed {typ or "file"} "{name}" from {source.get("name", "source image")}: {reason}')
+                    continue
+                seen[name] = {"type": typ, "blocks": blocks, "digest": digest, "source": source.get("name", "")}
+                copied.append(name)
+                required_blocks += blocks
+        out_info = c1541_directory_from_file(dst)
+        return dst.read_bytes(), {"warnings": warnings, "copied": copied, "required_blocks": required_blocks, "blocks_free": out_info.get("blocks_free"), "transcript": transcript}
+
+
+def create_disk_image_with_c1541(prg_bytes, prg_name, image_type, disk_name=None):
+    """Return D64/D71/D81 bytes containing one PRG, using c1541."""
+    image_type = image_type.lower().lstrip(".")
+    if image_type not in ("d64", "d71", "d81"):
+        raise ValueError(f"unsupported target image type: {image_type}")
+    if not c1541_available():
+        raise RuntimeError("c1541 is not installed; run scripts/setup-pi.sh or install VICE")
+    disk_name = (disk_name or prg_name or "converted")[:16]
+    fd_prg, prg_tmp = tempfile.mkstemp(suffix=".prg")
+    os.close(fd_prg)
+    fd_img, img_tmp = tempfile.mkstemp(suffix=f".{image_type}")
+    os.close(fd_img)
+    os.remove(img_tmp)
+    try:
+        Path(prg_tmp).write_bytes(prg_bytes)
+        r = subprocess.run([
+            "c1541",
+            "-format", f"{disk_name},u2", image_type, img_tmp,
+            "-write", prg_tmp, prg_name[:16] or "program",
+        ], text=True, capture_output=True, timeout=60)
+        if r.returncode != 0 or not Path(img_tmp).exists():
+            raise RuntimeError((r.stderr or r.stdout or f"c1541 could not create {image_type.upper()}").strip())
+        return Path(img_tmp).read_bytes()
+    finally:
+        for p in (prg_tmp, img_tmp):
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
 
 
 def extract_prg_with_c1541(img, wanted_name, suffix=".d64"):
@@ -495,7 +789,7 @@ def cold_boot(host):
     return reset_machine(host)
 
 
-def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
+def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64", status_callback=None):
     """Mount a known blank 1541 image, wait, then reset/cold boot.
 
     This gives the U2 a simple/known disk state before the machine reboots.
@@ -503,13 +797,19 @@ def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
     """
     try:
         print(f"STEP mount blank disk before reset: {blank_path}")
+        if status_callback:
+            status_callback("mounting", blank_path)
         status, body = mount_image(host, blank_path, drive)
         print(f"STEP mounted blank: HTTP {status} {body.strip()}")
+        if status_callback:
+            status_callback("mounted", blank_path)
         print("STEP wait 2s for U2 settle")
         time.sleep(2.0)
     except Exception as e:
         print(f"STEP blank disk warning: {e}")
     print("STEP cold boot/reset")
+    if status_callback:
+        status_callback("rebooting", None)
     return cold_boot(host)
 
 
@@ -1302,7 +1602,7 @@ def run_launch_script(host, image_path, machine_mode, script_dir="scripts"):
     return ran
 
 
-def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False):
+def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False, status_callback=None):
     """Cold boot, detect mode, optionally GO64, then mount/load/run a disk image.
 
     entry controls the LOAD target for disk mode. Blank means LOAD"*".
@@ -1318,7 +1618,7 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         unmount_image(host, drive)
     except Exception as e:
         print(f"STEP unmount warning: {e}")
-    settle_with_blank_disk_then_boot(host, drive)
+    settle_with_blank_disk_then_boot(host, drive, status_callback=status_callback)
     print("STEP wait for BASIC READY after reset")
     if not wait_for_screen_text(host, "READY", timeout=12.0):
         print("STEP READY not detected; falling back to 3s reset delay")
@@ -1337,6 +1637,8 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         if not wait_for_screen_text(host, "READY", timeout=8.0):
             print("STEP READY not detected before GO64; proceeding anyway")
         print("STEP request C64 mode: go64")
+        if status_callback:
+            status_callback("go64", None)
         inject_keys(host, "go64\r", machine_mode="c128")
         print("STEP wait for GO64 confirmation prompt")
         if not wait_for_screen_text(host, "ARE YOU SURE", timeout=8.0):
@@ -1356,8 +1658,12 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         active_mode = detected["mode"] if detected["mode"] in ("c64", "c128") else target_mode
 
     print("STEP mount image")
+    if status_callback:
+        status_callback("mounting", image_path)
     status, body = mount_image(host, image_path, drive)
     print(f"STEP mounted image for {target_mode}: HTTP {status} {body.strip()}")
+    if status_callback:
+        status_callback("mounted", image_path)
 
     load_target = entry or "*"
     print(f'STEP send LOAD command: lO"{load_target}",8,1')
@@ -1393,7 +1699,7 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
     return status, body
 
 
-def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False):
+def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False, status_callback=None):
     if not payload.startswith("U2+:"):
         raise RuntimeError("Payload does not start with U2+:")
     mode, rest = payload[4:].split(":", 1)
@@ -1417,7 +1723,7 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
     if mode in ("d64", "disk"):
         image_exts = (".d64", ".d71", ".d81")
         if lower.endswith(image_exts):
-            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp)
+            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp, status_callback=status_callback)
         if lower.endswith((".g64", ".tap")):
             raise RuntimeError("G64/TAP launch is intentionally unsupported for now")
     raise RuntimeError(f"Unsupported launch mode {mode!r} for path {path!r}")
@@ -1488,6 +1794,7 @@ def ensure_rows_table(conn, fields=None):
             notes TEXT NOT NULL DEFAULT '',
             quarantine_reason TEXT NOT NULL DEFAULT '',
             deleted_reason TEXT NOT NULL DEFAULT '',
+            size_bytes INTEGER,
             quarantined INTEGER NOT NULL DEFAULT 0,
             fk_Status_ID INTEGER REFERENCES Status(pk_ID),
             fk_StorageStatus_ID INTEGER REFERENCES StorageStatus(pk_ID),
@@ -1514,6 +1821,10 @@ def ensure_rows_table(conn, fields=None):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_title ON Image(title)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_path ON Image(path)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_payload ON Image(payload)")
+    try:
+        conn.execute("ALTER TABLE Image ADD COLUMN size_bytes INTEGER")
+    except sqlite3.OperationalError:
+        pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_Status ON Image(fk_Status_ID)")
     conn.execute(
         """
@@ -1580,6 +1891,7 @@ def ensure_rows_table(conn, fields=None):
             i.quarantined,
             i.quarantine_reason,
             i.deleted_reason,
+            i.size_bytes,
             i.notes,
             i.created_at,
             i.updated_at
@@ -1601,20 +1913,31 @@ def read_sqlite_rows(path):
 
 
 def write_sqlite_rows(path, rows, fields):
+    """Upsert rows by Image.path while preserving pk_ID values.
+
+    Earlier SQLite migration code used DELETE + INSERT for every save, which
+    churned pk_ID/autoincrement values and made row identity unstable. Saves are
+    now path-based upserts; rows not present in this call are left alone so a
+    filtered TUI view cannot accidentally delete hidden/unsupported rows.
+    Inventory reconciliation handles present/missing/deleted state separately.
+    """
     with sqlite_connect(path) as conn:
         ensure_rows_table(conn, fields)
-        conn.execute("DELETE FROM Image")
         for r in rows:
+            row_path = r.get("path", "")
+            if not row_path:
+                continue
             file_type = r.get("file_type") or r.get("type")
             vals = {
                 "title": r.get("title", ""),
-                "path": r.get("path", ""),
+                "path": row_path,
                 "payload": r.get("payload", ""),
                 "entry": r.get("entry", ""),
                 "detail": r.get("detail", ""),
                 "notes": r.get("notes", ""),
                 "quarantine_reason": r.get("quarantine_reason", ""),
                 "deleted_reason": r.get("deleted_reason", ""),
+                "size_bytes": int(r.get("size_bytes")) if str(r.get("size_bytes", "")).strip().isdigit() else None,
                 "quarantined": 1 if str(r.get("quarantined", "")).lower() in ("1", "true", "yes", "y") else 0,
                 "fk_Status_ID": lookup_id(conn, "Status", r.get("status", "")),
                 "fk_StorageStatus_ID": lookup_id(conn, "StorageStatus", r.get("storage_status", "present") or "present"),
@@ -1624,7 +1947,12 @@ def write_sqlite_rows(path, rows, fields):
             }
             columns = ", ".join(vals)
             placeholders = ", ".join("?" for _ in vals)
-            conn.execute(f"INSERT INTO Image ({columns}) VALUES ({placeholders})", list(vals.values()))
+            updates = ", ".join(f"{col}=excluded.{col}" for col in vals if col != "path")
+            conn.execute(
+                f"INSERT INTO Image ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(path) DO UPDATE SET {updates}",
+                list(vals.values()),
+            )
 
 
 def import_scan_paths(db_path, paths):

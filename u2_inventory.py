@@ -98,6 +98,7 @@ def normalize_inventory_row(row):
         "entry": entry,
         "payload": payload_for(mode, path, entry) if mode and path else row.get("payload", ""),
         "detail": row.get("detail", ""),
+        "size_bytes": row.get("size_bytes", ""),
         "machine_mode": row.get("machine_mode") or "",
         "storage_status": row.get("storage_status") or "present",
     })
@@ -106,7 +107,7 @@ def normalize_inventory_row(row):
 
 def merge_inventory_rows(existing, scanned):
     """Append only new exact normalized paths; preserve existing curated rows."""
-    base_fields = ["title", "path", "type", "file_type", "mode", "entry", "payload", "detail", "machine_mode", "status", "storage_status", "notes", "quarantined", "quarantine_reason", "deleted_reason"]
+    base_fields = ["title", "path", "type", "file_type", "mode", "entry", "payload", "detail", "size_bytes", "machine_mode", "status", "storage_status", "notes", "quarantined", "quarantine_reason", "deleted_reason"]
     merged = [normalize_inventory_row(r) for r in existing]
     seen = {strip_usb_prefix(r.get("path", "")) for r in merged if r.get("path")}
     added = 0
@@ -155,7 +156,9 @@ def main():
     print(f"Known file types imported: {', '.join(exts)}")
     print(f"Enabled/displayed by default: {', '.join(enabled_exts)}")
 
-    paths = [path for path, _ in walk_ftp(host, args.root, args.max_depth, exts, progress_depth=args.progress_depth)]
+    walked = list(walk_ftp(host, args.root, args.max_depth, exts, progress_depth=args.progress_depth))
+    size_by_path = {path: meta.get("size", "") for path, meta in walked}
+    paths = [path for path, _ in walked]
     if is_sqlite_path(args.out):
         import_scan_paths(args.out, paths)
         scan_stats = reconcile_scan_paths(args.out)
@@ -168,9 +171,10 @@ def main():
         print(f"Inspecting {path}")
         row = suggest_for_file(host, path, inspect_disks=args.inspect_disks)
         if row:
+            row["size_bytes"] = size_by_path.get(path, "")
             scanned.append(row)
 
-    fields = ["title", "path", "type", "mode", "entry", "payload", "detail"]
+    fields = ["title", "path", "type", "mode", "entry", "payload", "detail", "size_bytes"]
     if Path(args.out).exists() and not args.replace:
         existing = read_csv(args.out)
         rows, fields, added = merge_inventory_rows(existing, scanned)

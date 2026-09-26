@@ -12,16 +12,86 @@ import sys
 import tempfile
 import termios
 import time
-from pathlib import Path
+import atexit
+import hashlib
+import shutil
+from pathlib import Path, PurePosixPath
 from u2_common import *
 try:
     from u2_nfc_launcher import open_serial, require_response, find_tag, read_ntag_memory, parse_ndef_tlv, decode_first_ndef_text_or_uri
 except Exception:
     open_serial = require_response = find_tag = read_ntag_memory = parse_ndef_tlv = decode_first_ndef_text_or_uri = None
 
-FIELDS = ["title", "payload", "mode", "path", "entry", "machine_mode", "file_type", "detail", "status", "notes"]
+FIELDS = ["title", "payload", "mode", "path", "entry", "machine_mode", "file_type", "detail", "size_bytes", "status", "storage_status", "notes"]
 UNSUPPORTED_EXTS = (".g64", ".tap")
 UNSUPPORTED_TYPES = {"g64", "tap"}
+
+
+class SessionFileCache:
+    def __init__(self, enabled=True, cache_dir="auto", max_fraction=0.25):
+        self.enabled = enabled
+        self.max_fraction = max_fraction
+        self.root = None
+        if enabled:
+            base = Path("/dev/shm") if cache_dir == "auto" and Path("/dev/shm").is_dir() else Path(tempfile.gettempdir())
+            if cache_dir not in (None, "", "auto"):
+                base = Path(cache_dir)
+            self.root = Path(tempfile.mkdtemp(prefix="u2_curator_cache_", dir=str(base)))
+            atexit.register(self.cleanup)
+
+    def cleanup(self):
+        if self.root:
+            shutil.rmtree(self.root, ignore_errors=True)
+            self.root = None
+
+    def _path_for(self, ultimate_path):
+        suffix = Path(ultimate_path).suffix[:16]
+        name = hashlib.sha256(strip_usb_prefix(ultimate_path).encode("utf-8", "replace")).hexdigest() + suffix
+        return self.root / name
+
+    def _maybe_prune(self):
+        if not self.enabled or not self.root:
+            return
+        try:
+            usage = shutil.disk_usage(self.root)
+            if usage.used / usage.total < self.max_fraction:
+                return
+            files = sorted((p for p in self.root.iterdir() if p.is_file()), key=lambda p: p.stat().st_atime)
+            for p in files[:max(1, len(files) // 2)]:
+                p.unlink(missing_ok=True)
+                usage = shutil.disk_usage(self.root)
+                if usage.used / usage.total < self.max_fraction * 0.8:
+                    break
+        except Exception:
+            pass
+
+    def get(self, host, ultimate_path):
+        if not self.enabled or not self.root:
+            return ftp_download(host, ultimate_path)
+        p = self._path_for(ultimate_path)
+        if p.exists():
+            os.utime(p, None)
+            return p.read_bytes()
+        data = ftp_download(host, ultimate_path)
+        self._maybe_prune()
+        try:
+            p.write_bytes(data)
+        except OSError:
+            pass
+        return data
+
+    def put(self, ultimate_path, data):
+        if not self.enabled or not self.root:
+            return
+        self._maybe_prune()
+        try:
+            self._path_for(ultimate_path).write_bytes(data)
+        except OSError:
+            pass
+
+
+def key_f(n):
+    return curses.KEY_F0 + n
 
 
 def is_supported_row(row):
@@ -434,6 +504,467 @@ def c1541_directory_for_row(host, row):
     return raw, entries
 
 
+def merge_log_path_for(image_path):
+    safe = strip_usb_prefix(image_path).strip("/").replace("/", "__") or "root"
+    return Path("merge_logs") / (safe + ".log")
+
+
+def show_text_viewer(stdscr, title, text):
+    lines = [title, ""] + str(text).splitlines() + ["", "q/Esc/Enter returns."]
+    top = 0
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        body_h = max(1, h - 1)
+        top = max(0, min(top, max(0, len(lines) - body_h)))
+        for y, line in enumerate(lines[top:top + body_h]):
+            attr = curses.A_BOLD if top + y == 0 else 0
+            stdscr.addnstr(y, 0, line, w - 1, attr)
+        footer = "↑/↓ scroll  PgUp/PgDn page  Home/End  q/Esc/Enter return"
+        if len(lines) > body_h:
+            footer += f"  {top+1}-{min(len(lines), top+body_h)}/{len(lines)}"
+        stdscr.addnstr(h - 1, 0, footer, w - 1, curses.A_DIM)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (ord('q'), 27, 10, 13, ord(' ')):
+            return
+        if ch == curses.KEY_UP:
+            top -= 1
+        elif ch == curses.KEY_DOWN:
+            top += 1
+        elif ch == curses.KEY_PPAGE:
+            top -= body_h
+        elif ch == curses.KEY_NPAGE:
+            top += body_h
+        elif ch == curses.KEY_HOME:
+            top = 0
+        elif ch == curses.KEY_END:
+            top = len(lines)
+
+
+def show_status_popup(stdscr, title, lines=()):
+    h, w = stdscr.getmaxyx()
+    lines = [str(x) for x in lines]
+    width = min(w - 4, max(40, len(title) + 4, *(len(x) + 4 for x in lines or [""])))
+    height = min(h - 2, max(5, len(lines) + 4))
+    y = max(0, (h - height) // 2)
+    x = max(0, (w - width) // 2)
+    win = curses.newwin(height, width, y, x)
+    win.box()
+    win.addnstr(1, 2, title, width - 4, curses.A_BOLD)
+    for i, line in enumerate(lines[:height - 4], start=2):
+        win.addnstr(i, 2, line, width - 4)
+    win.refresh()
+    stdscr.refresh()
+
+
+def choose_menu(stdscr, title, items):
+    """Return selected item dict, or None. Items: {label, enabled=True, hint=''}"""
+    enabled = [i for i, it in enumerate(items) if it.get("enabled", True)]
+    if not enabled:
+        return None
+    pos = enabled[0]
+    while True:
+        h, w = stdscr.getmaxyx()
+        width = min(w - 4, max(48, len(title) + 4, *(len(it.get("label", "")) + len(it.get("hint", "")) + 8 for it in items)))
+        height = min(h - 2, len(items) + 4)
+        y = max(0, (h - height) // 2)
+        x = max(0, (w - width) // 2)
+        win = curses.newwin(height, width, y, x)
+        win.keypad(True)
+        win.box()
+        win.addnstr(1, 2, title, width - 4, curses.A_BOLD)
+        for row_y, item_idx in enumerate(range(0, min(len(items), height - 3)), start=2):
+            it = items[item_idx]
+            label = it.get("label", "")
+            hint = it.get("hint", "")
+            text = label + (("  " + hint) if hint else "")
+            attr = curses.A_REVERSE if item_idx == pos else 0
+            if not it.get("enabled", True):
+                attr |= curses.A_DIM
+            win.addnstr(row_y, 2, text, width - 4, attr)
+        win.refresh()
+        ch = win.getch()
+        if ch in (27, ord('q'), ord('Q')):
+            return None
+        if ch in (10, 13):
+            if items[pos].get("enabled", True):
+                return items[pos]
+        elif ch == curses.KEY_UP:
+            prevs = [i for i in enabled if i < pos]
+            pos = prevs[-1] if prevs else enabled[-1]
+        elif ch == curses.KEY_DOWN:
+            nexts = [i for i in enabled if i > pos]
+            pos = nexts[0] if nexts else enabled[0]
+
+
+def conversion_targets(file_type):
+    ft = (file_type or "").lower().lstrip(".")
+    return {
+        "prg": ["d64", "d71", "d81"],
+        "d64": ["d71", "d81"],
+        "d71": ["d81"],
+    }.get(ft, [])
+
+
+def row_parent_dir(row):
+    return str(PurePosixPath(strip_usb_prefix(row.get("path", ""))).parent)
+
+
+def row_basename(row):
+    return PurePosixPath(strip_usb_prefix(row.get("path", ""))).name
+
+
+def is_disk_image_row(row):
+    ft = (row.get("file_type") or row.get("type") or Path(row.get("path", "")).suffix.lstrip(".")).lower()
+    return ft in ("d64", "d71", "d81")
+
+
+def bucket_contains(bucket, row):
+    if not bucket:
+        return False
+    return strip_usb_prefix(row.get("path", "")) in bucket.get("paths", set())
+
+
+def toggle_merge_bucket(bucket, row):
+    if not is_disk_image_row(row):
+        return bucket, "Only D64/D71/D81 images can be added to merge bucket"
+    path = strip_usb_prefix(row.get("path", ""))
+    parent = row_parent_dir(row)
+    if not bucket:
+        bucket = {"path": parent, "items": [path], "paths": {path}}
+        return bucket, f"Merge bucket created for {parent}; added {row_basename(row)}"
+    if path in bucket["paths"]:
+        bucket["paths"].remove(path)
+        bucket["items"] = [p for p in bucket["items"] if p != path]
+        if not bucket["items"]:
+            return None, "Removed item; merge bucket cleared"
+        return bucket, f"Removed {row_basename(row)} from merge bucket"
+    if parent != bucket["path"]:
+        return bucket, f"Merge bucket is for {bucket['path']}"
+    bucket["items"].append(path)
+    bucket["paths"].add(path)
+    return bucket, f"Added {row_basename(row)} to merge bucket"
+
+
+def converted_path_for(path, target_type):
+    p = PurePosixPath(strip_usb_prefix(path))
+    return str(p.with_suffix("." + target_type.lower()))
+
+
+def refresh_one_path_row(host, rows, path, title=None):
+    from u2_inventory import suggest_for_file
+    row = suggest_for_file(host, path, inspect_disks=False)
+    if not row:
+        lower = path.lower()
+        file_type = Path(lower).suffix.lstrip(".")
+        mode = "disk" if file_type in ("d64", "d71", "d81", "g64") else ("crt" if file_type == "crt" else "prg")
+        row = {
+            "title": title or title_from_path(path),
+            "path": strip_usb_prefix(path),
+            "type": file_type,
+            "file_type": file_type,
+            "mode": mode,
+            "entry": "",
+            "payload": payload_for(mode, path),
+            "detail": file_type.upper(),
+            "machine_mode": "",
+            "storage_status": "present",
+        }
+    if title:
+        row["title"] = title
+    row.setdefault("status", "")
+    row.setdefault("notes", "")
+    row.setdefault("storage_status", "present")
+    key = strip_usb_prefix(path)
+    for i, existing in enumerate(rows):
+        if strip_usb_prefix(existing.get("path", "")) == key:
+            rows[i].update(row)
+            return i
+    rows.append(row)
+    return len(rows) - 1
+
+
+def confirm_yes_no(stdscr, title, lines=()):
+    show_status_popup(stdscr, title, list(lines) + ["", "y = yes, anything else = no"])
+    ch = stdscr.getch()
+    return ch in (ord('y'), ord('Y'))
+
+
+def find_row_by_path(rows, path):
+    key = strip_usb_prefix(path)
+    for i, r in enumerate(rows):
+        if strip_usb_prefix(r.get("path", "")) == key:
+            return i
+    return None
+
+
+def default_merge_base(bucket):
+    first = PurePosixPath(bucket["items"][0]).stem
+    for token in (".disk1", " disk 1", " disk1", " side a", " side 1"):
+        first = first.replace(token, "")
+    return first.strip() or "merged"
+
+
+def target_capacity(t):
+    return {"d64": 664, "d71": 1328, "d81": 3160}[t]
+
+
+def perform_merge_bucket(stdscr, host, rows, bucket, cache=None):
+    if not bucket or not bucket.get("items"):
+        return None, "Merge bucket is empty"
+    targets = [{"label": "Auto smallest", "target": "auto"}, {"label": "D64", "target": "d64"}, {"label": "D71", "target": "d71"}, {"label": "D81", "target": "d81"}]
+    chosen = choose_menu(stdscr, f"Merge {len(bucket['items'])} image(s)", targets)
+    if not chosen:
+        return None, "Merge cancelled"
+    show_status_popup(stdscr, "Downloading source images", [bucket["path"], f"{len(bucket['items'])} image(s)"])
+    sources = []
+    total_blocks = 0
+    seen_entries = {}
+    duplicate_warnings = []
+    for path in bucket["items"]:
+        data = cache.get(host, path) if cache else ftp_download(host, path)
+        info = c1541_directory(data, suffix=Path(path).suffix or ".d64")
+        for e in info.get("entries", []):
+            name = e.get("name", "")[:16]
+            if not name:
+                continue
+            typ = e.get("type", "")
+            blocks = int(e.get("blocks") or 0)
+            prior = seen_entries.get(name)
+            if prior:
+                if prior["type"] != typ or prior["blocks"] != blocks:
+                    duplicate_warnings.append(f'Duplicate differs; skipped "{name}" from {PurePosixPath(path).name}')
+                continue
+            seen_entries[name] = {"type": typ, "blocks": blocks}
+            total_blocks += blocks
+        sources.append({"name": PurePosixPath(path).name, "suffix": Path(path).suffix or ".d64", "bytes": data})
+    target = chosen["target"]
+    if target == "auto":
+        target = next((t for t in ("d64", "d71", "d81") if total_blocks <= target_capacity(t)), "d81")
+    elif total_blocks > target_capacity(target):
+        bigger = [t for t in ("d64", "d71", "d81") if target_capacity(t) >= total_blocks and target_capacity(t) > target_capacity(target)]
+        if not bigger:
+            return None, f"Merge will not fit in {target.upper()} or D81 ({total_blocks} blocks)"
+        sub = choose_menu(stdscr, f"{total_blocks} blocks will not fit in {target.upper()}", [{"label": t.upper(), "target": t} for t in bigger])
+        if not sub:
+            return None, "Merge cancelled"
+        target = sub["target"]
+    base = default_merge_base(bucket)
+    dest = str(PurePosixPath(bucket["path"]) / f"{base}.merged.{target}")
+    title = f"{base} - Merged [to {target.upper()}]"
+    exists = ftp_exists(host, dest)
+    old_i = find_row_by_path(rows, dest)
+    if exists and ".merged." not in PurePosixPath(dest).name:
+        return None, f"Refusing to overwrite non-merged file: {dest}"
+    if exists and not confirm_yes_no(stdscr, "Output exists", [dest, "Overwrite regenerated merge output?"]):
+        return None, "Merge cancelled"
+    if old_i is not None and not exists:
+        old = rows[old_i]
+        if old.get("status") == "failed" or old.get("storage_status") in ("deleted", "missing"):
+            if not confirm_yes_no(stdscr, "Previous failed/deleted output", [dest, "Recreate this merge output?"]):
+                return None, "Merge cancelled"
+    show_status_popup(stdscr, f"Merging to {target.upper()}", [dest])
+    image, report = merge_disk_images_with_c1541(sources, target, disk_name=None)
+    log_path = merge_log_path_for(dest)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_lines = [
+        f"Merge target: {dest}",
+        f"Title: {title}",
+        f"Target type: {target.upper()}",
+        "",
+        "Sources:",
+        *[f"  {s['name']}" for s in sources],
+        "",
+        f"Copied entries: {len(report.get('copied', []))}",
+        f"Required blocks: {report.get('required_blocks', '')}",
+        f"Blocks free after merge: {report.get('blocks_free', '')}",
+        "",
+        "Warnings:",
+        *(report.get('warnings') or ["  none"]),
+        "",
+        "c1541 stdout/stderr transcript:",
+        *(report.get('transcript') or ["  none"]),
+    ]
+    log_path.write_text("\n".join(log_lines) + "\n")
+    show_status_popup(stdscr, "Uploading merged image", [dest])
+    ftp_upload(host, dest, image)
+    if cache:
+        cache.put(dest, image)
+    new_pos = refresh_one_path_row(host, rows, dest, title=title)
+    if new_pos is not None:
+        rows[new_pos]["size_bytes"] = str(len(image))
+        first_source = find_row_by_path(rows, bucket["items"][0])
+        if first_source is not None:
+            rows[new_pos]["machine_mode"] = rows[first_source].get("machine_mode", "")
+    warnings = list(duplicate_warnings) + list(report.get("warnings", []))
+    warn = f"; {len(warnings)} warning(s)" if warnings else ""
+    return (new_pos if new_pos is not None else old_i), f"Merged {len(sources)} image(s) to {dest}{warn}"
+
+
+def perform_prg_to_image(stdscr, host, rows, pos, target_type, cache=None):
+    row = rows[pos]
+    src = row.get("path", "")
+    dest = converted_path_for(src, target_type)
+    show_status_popup(stdscr, "Checking target", [dest])
+    if ftp_exists(host, dest):
+        return pos, f"Target already exists: {dest}"
+    show_status_popup(stdscr, "Downloading PRG", [src])
+    prg = cache.get(host, src) if cache else ftp_download(host, src)
+    prg_name = PurePosixPath(src).stem[:16]
+    show_status_popup(stdscr, f"Creating {target_type.upper()}", [prg_name])
+    image = create_disk_image_with_c1541(prg, prg_name, target_type, disk_name=prg_name)
+    show_status_popup(stdscr, "Uploading converted image", [dest])
+    ftp_upload(host, dest, image)
+    if cache:
+        cache.put(dest, image)
+    new_title = f"{row.get('title') or title_from_path(src)} - Converted [to {target_type.upper()}]"
+    new_pos = refresh_one_path_row(host, rows, dest, title=new_title)
+    if new_pos is not None:
+        rows[new_pos]["size_bytes"] = str(len(image))
+        rows[new_pos]["machine_mode"] = row.get("machine_mode", "")
+    return (new_pos if new_pos is not None else pos), f"Created {dest}"
+
+
+def perform_disk_to_image(stdscr, host, rows, pos, target_type, cache=None):
+    row = rows[pos]
+    src = row.get("path", "")
+    dest = converted_path_for(src, target_type)
+    show_status_popup(stdscr, "Checking target", [dest])
+    if ftp_exists(host, dest):
+        return pos, f"Target already exists: {dest}"
+    show_status_popup(stdscr, "Downloading disk image", [src])
+    img = cache.get(host, src) if cache else ftp_download(host, src)
+    show_status_popup(stdscr, f"Converting to {target_type.upper()}", [src, "Extracting files and rebuilding image..."])
+    out = convert_disk_image_with_c1541(img, Path(src).suffix or ".d64", target_type)
+    show_status_popup(stdscr, "Uploading converted image", [dest])
+    ftp_upload(host, dest, out)
+    if cache:
+        cache.put(dest, out)
+    new_title = f"{row.get('title') or title_from_path(src)} - Converted [to {target_type.upper()}]"
+    new_pos = refresh_one_path_row(host, rows, dest, title=new_title)
+    if new_pos is not None:
+        rows[new_pos]["size_bytes"] = str(len(out))
+        rows[new_pos]["machine_mode"] = row.get("machine_mode", "")
+    return (new_pos if new_pos is not None else pos), f"Created {dest}"
+
+
+def perform_disk_to_prg(stdscr, host, rows, pos, cache=None):
+    row = rows[pos]
+    entry = show_disk_directory(stdscr, host, row, allow_select=True)
+    if not entry:
+        return pos, "Extract PRG cancelled"
+    src = row.get("path", "")
+    dest = str(PurePosixPath(strip_usb_prefix(src)).with_name(entry + ".prg"))
+    show_status_popup(stdscr, "Checking target", [dest])
+    if ftp_exists(host, dest):
+        return pos, f"Target already exists: {dest}"
+    show_status_popup(stdscr, "Downloading disk image", [src])
+    img = cache.get(host, src) if cache else ftp_download(host, src)
+    show_status_popup(stdscr, "Extracting PRG", [entry])
+    _, prg = extract_prg_with_c1541(img, entry, suffix=Path(src).suffix or ".d64")
+    show_status_popup(stdscr, "Uploading extracted PRG", [dest])
+    ftp_upload(host, dest, prg)
+    if cache:
+        cache.put(dest, prg)
+    new_title = f"{row.get('title') or title_from_path(src)} - Extracted [{entry}]"
+    new_pos = refresh_one_path_row(host, rows, dest, title=new_title)
+    if new_pos is not None:
+        rows[new_pos]["size_bytes"] = str(len(prg))
+        rows[new_pos]["machine_mode"] = row.get("machine_mode", "")
+    return (new_pos if new_pos is not None else pos), f"Extracted {dest}"
+
+
+def mounted_paths_from_status(status_rows):
+    out = set()
+    for row in status_rows or []:
+        try:
+            mounted = row[4]
+        except Exception:
+            mounted = ""
+        if mounted:
+            out.add(strip_usb_prefix(str(mounted)))
+    return out
+
+
+def delete_image_from_u2(stdscr, host, row, status_rows):
+    path = strip_usb_prefix(row.get("path", ""))
+    if not path:
+        return "No path to delete"
+    if not confirm_yes_no(stdscr, "Delete image from U2?", [path, "DB row will remain marked deleted."]):
+        return "Delete cancelled"
+    if path in mounted_paths_from_status(status_rows):
+        show_status_popup(stdscr, "Selected image is mounted", ["Mounting /blank.d64 before delete...", path])
+        try:
+            mount_image(host, "/blank.d64", "a")
+            time.sleep(2.0)
+        except Exception:
+            # Continue. If delete fails, the final status will say so.
+            time.sleep(1.0)
+    show_status_popup(stdscr, "Deleting from U2", [path])
+    try:
+        ftp_delete(host, path)
+    except Exception:
+        # Missing/odd FTP delete errors should still end with local curation state
+        # saying the file is no longer wanted/present.
+        pass
+    row["storage_status"] = "deleted"
+    row["deleted_reason"] = "Deleted from TUI"
+    return f"Deleted/marked deleted: {path}"
+
+
+def image_actions_menu(stdscr, host, rows, pos, cache=None, bucket=None, status_rows=None):
+    row = rows[pos]
+    ft = (row.get("file_type") or row.get("type") or Path(row.get("path", "")).suffix.lstrip(".")).lower()
+    targets = conversion_targets(ft)
+    items = []
+    log_path = merge_log_path_for(row.get("path", ""))
+    if bucket:
+        items.extend([
+            {"label": "Merge selected images...", "action": "merge", "enabled": bool(bucket.get("items"))},
+            {"label": f"Clear merge bucket ({len(bucket.get('items', []))} item(s))", "action": "clear_bucket", "enabled": True},
+        ])
+    items += [
+        {"label": f"Convert {ft.upper()} to...", "action": "convert", "enabled": bool(targets)},
+        {"label": "View merge log...", "action": "view_merge_log", "enabled": log_path.exists()},
+        {"label": f"Extract PRG from {ft.upper()}...", "action": "extract", "enabled": ft in ("d64", "d71", "d81")},
+        {"label": "Move image...", "action": "move", "enabled": False, "hint": "reserved"},
+        {"label": "Delete image from U2...", "action": "delete", "enabled": bool(row.get("path")) and not bucket, "hint": "disabled while merge bucket active" if bucket else ""},
+        {"label": "Quarantine image...", "action": "quarantine", "enabled": False, "hint": "reserved"},
+    ]
+    chosen = choose_menu(stdscr, f"Image actions: {row.get('title','')}", items)
+    if not chosen:
+        return pos, "Image actions cancelled", bucket
+    if chosen["action"] == "merge":
+        new_pos, merge_msg = perform_merge_bucket(stdscr, host, rows, bucket, cache=cache)
+        # Successful merge creates/selects a derived output, so the source bucket
+        # has served its purpose and should not keep dimming/protecting rows.
+        new_bucket = None if new_pos is not None and str(merge_msg).startswith("Merged ") else bucket
+        return (new_pos if new_pos is not None else pos), merge_msg, new_bucket
+    if chosen["action"] == "clear_bucket":
+        return pos, "Merge bucket cleared", None
+    if chosen["action"] == "view_merge_log":
+        show_text_viewer(stdscr, f"Merge log: {row.get('path','')}", log_path.read_text(errors="replace"))
+        return pos, f"Viewed merge log {log_path}", bucket
+    if chosen["action"] == "delete":
+        return pos, delete_image_from_u2(stdscr, host, row, status_rows), bucket
+    if chosen["action"] == "extract":
+        new_pos, m = perform_disk_to_prg(stdscr, host, rows, pos, cache=cache)
+        return new_pos, m, bucket
+    if chosen["action"] == "convert":
+        sub = choose_menu(stdscr, f"Convert {ft.upper()} to...", [{"label": t.upper(), "target": t} for t in targets])
+        if not sub:
+            return pos, "Conversion cancelled", bucket
+        if ft == "prg":
+            new_pos, m = perform_prg_to_image(stdscr, host, rows, pos, sub["target"], cache=cache)
+            return new_pos, m, bucket
+        if ft in ("d64", "d71"):
+            new_pos, m = perform_disk_to_image(stdscr, host, rows, pos, sub["target"], cache=cache)
+            return new_pos, m, bucket
+        return pos, f"{ft.upper()} to {sub['target'].upper()} conversion reserved", bucket
+    return pos, "Action reserved", bucket
+
+
 def show_disk_directory(stdscr, host, row, allow_select=False):
     try:
         raw, entries = c1541_directory_for_row(host, row)
@@ -610,12 +1141,23 @@ def refresh_status_rows(host):
         return [], f"Drive status unavailable: {e}"
 
 
+def refresh_status_rows_after_drive_change(host):
+    # U2 drive state can lag just behind a successful mount/remove API response.
+    # Give firmware a brief moment, then poll once for the status bar.
+    time.sleep(0.25)
+    return refresh_status_rows(host)
+
+
 def draw_drive_status(stdscr, y, w, rows, err=None):
     if err:
         stdscr.addnstr(y, 0, err, w-1, curses.color_pair(3) if curses.has_colors() else 0)
         return 1
     for offset, (label, bus, enabled, dtype, mounted, last_error) in enumerate(rows[:3]):
         x = 0
+        # Clear the whole status row before repainting; mounted paths can shrink
+        # between updates (/long/image.d64 -> /blank.d64), leaving stale suffixes.
+        stdscr.move(y + offset, 0)
+        stdscr.clrtoeol()
         name = f"Drive {label}/{bus:>2}: "
         stdscr.addnstr(y + offset, x, name, max(0, w-1-x)); x += len(name)
         state_word = "Enabled" if enabled else "Disabled"
@@ -665,6 +1207,10 @@ def selected_issue(host, row, cache):
     if not lower.endswith(".prg"):
         return ""
     if path in cache:
+        return cache[path]
+    size_value = row.get("size_bytes", "")
+    if str(size_value).strip().isdigit():
+        cache[path] = "File problem: PRG is 0 bytes" if int(size_value) == 0 else ""
         return cache[path]
     try:
         # ftp_size may emit expected Usb0/Usb1 fallback notes; suppress them
@@ -757,12 +1303,12 @@ def row_identity(row):
 
 
 DEFAULT_SQL_VIEWS = [
-    ("Normal active rows", "SELECT * FROM image_rows WHERE COALESCE(storage_status, 'present') = 'present' AND COALESCE(quarantined, 0) = 0 AND COALESCE(file_type_enabled, 1) = 1 ORDER BY title, path"),
-    ("Approved", "SELECT * FROM image_rows WHERE status = 'approved' ORDER BY title, path"),
-    ("Failed", "SELECT * FROM image_rows WHERE status = 'failed' ORDER BY title, path"),
-    ("C64", "SELECT * FROM image_rows WHERE machine_mode IN ('', 'c64', '64') ORDER BY title, path"),
-    ("C128", "SELECT * FROM image_rows WHERE machine_mode IN ('c128', '128') ORDER BY title, path"),
-    ("CRT", "SELECT * FROM image_rows WHERE file_type = 'crt' OR path LIKE '%.crt' ORDER BY title, path"),
+    ("Normal active rows", "SELECT * FROM image_rows WHERE COALESCE(storage_status, 'present') = 'present' AND COALESCE(quarantined, 0) = 0 AND COALESCE(file_type_enabled, 1) = 1 ORDER BY lower(title), lower(path)"),
+    ("Approved", "SELECT * FROM image_rows WHERE status = 'approved' ORDER BY lower(title), lower(path)"),
+    ("Failed", "SELECT * FROM image_rows WHERE status = 'failed' ORDER BY lower(title), lower(path)"),
+    ("C64", "SELECT * FROM image_rows WHERE machine_mode IN ('', 'c64', '64') ORDER BY lower(title), lower(path)"),
+    ("C128", "SELECT * FROM image_rows WHERE machine_mode IN ('c128', '128') ORDER BY lower(title), lower(path)"),
+    ("CRT", "SELECT * FROM image_rows WHERE file_type = 'crt' OR path LIKE '%.crt' ORDER BY lower(title), lower(path)"),
 ]
 
 
@@ -922,7 +1468,7 @@ def sql_view_keys(db_path, sql):
     return seen, {key: i for i, key in enumerate(ordered)}
 
 
-def run(stdscr, rows, host, out, log_path, state_path):
+def run(stdscr, rows, host, out, log_path, state_path, cache=None):
     curses.curs_set(0)
     if curses.has_colors():
         curses.start_color()
@@ -931,6 +1477,10 @@ def run(stdscr, rows, host, out, log_path, state_path):
         curses.init_pair(2, curses.COLOR_RED, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_WHITE, -1)
+        # Machine-mode accents. Prefer bright 256-color approximations when the
+        # terminal supports them: C64-ish light blue and C128-ish green.
+        curses.init_pair(5, 12 if curses.COLORS > 16 else curses.COLOR_BLUE, -1)
+        curses.init_pair(6, 10 if curses.COLORS > 16 else curses.COLOR_GREEN, -1)
     status_rows, status_err = refresh_status_rows(host)
     issue_cache = {}
     pos = 0
@@ -940,6 +1490,7 @@ def run(stdscr, rows, host, out, log_path, state_path):
     sql_view_name = "All loaded rows"
     sql_filter_keys = None
     sql_filter_rank = None
+    merge_bucket = None
     for r in rows:
         if not r.get("file_type") and r.get("type"):
             r["file_type"] = r.get("type", "")
@@ -973,6 +1524,8 @@ def run(stdscr, rows, host, out, log_path, state_path):
             title += f"  view:{sql_view_name}"
         if search_query:
             title += f"  /{search_query}"
+        if merge_bucket:
+            title += f"  bucket:{len(merge_bucket.get('items', []))}@{merge_bucket.get('path')}"
         stdscr.addnstr(0, 0, title, w-1, curses.A_BOLD)
         list_start = draw_command_panel(stdscr, w, current_row, current_issue)
         panel_x = max(45, w - 34) if w >= 100 else w
@@ -1002,12 +1555,31 @@ def run(stdscr, rows, host, out, log_path, state_path):
             stdscr.addnstr(list_start, 0, text, w-1, attr)
         for y, idx in enumerate(visible[top:top + list_h], start=list_start):
             r = rows[idx]
-            mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
-            target = "128" if r.get("machine_mode", "c64") in ("c128", "128") else "64"
+            is_128 = r.get("machine_mode", "c64") in ("c128", "128")
+            target = "128" if is_128 else "C64"
             kind = (r.get("type") or r.get("file_type") or r.get("mode") or "").upper()
-            line = f"{idx+1:3d} [{mark}] [{target}] {r.get('title','')}  ({kind})"
+            if merge_bucket:
+                # Bucket selection mode changes focus: reuse the status column for
+                # bucket membership and hide approve/fail state for visual clarity.
+                mark = "+" if bucket_contains(merge_bucket, r) else " "
+            else:
+                mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
+            prefix = f"{idx+1:3d} [{mark}] ["
+            target_text = target
+            suffix = f"] {r.get('title','')}  ({kind})"
             attr = curses.A_REVERSE if idx == pos else 0
-            stdscr.addnstr(y, 0, line, left_w-1, attr)
+            if merge_bucket:
+                if row_parent_dir(r) != merge_bucket.get("path"):
+                    attr |= curses.A_DIM
+                elif curses.has_colors():
+                    attr |= curses.color_pair(3)
+            x = 0
+            stdscr.addnstr(y, x, prefix, max(0, left_w-1-x), attr); x += len(prefix)
+            target_attr = attr
+            if curses.has_colors():
+                target_attr = attr | curses.color_pair(6 if is_128 else 5)
+            stdscr.addnstr(y, x, target_text, max(0, left_w-1-x), target_attr); x += len(target_text)
+            stdscr.addnstr(y, x, suffix, max(0, left_w-1-x), attr)
         status_w = w if (w < 100 or status_y >= cmd_rows) else left_w
         detail_w = w if (w < 100 or detail_y >= cmd_rows) else left_w
         footer_w = w if (w < 100 or h - 1 >= cmd_rows) else left_w
@@ -1095,30 +1667,26 @@ def run(stdscr, rows, host, out, log_path, state_path):
             if visible:
                 vi = visible.index(pos)
                 pos = visible[max(0, vi-1)]
-            status_rows, status_err = refresh_status_rows(host)
         elif ch == curses.KEY_DOWN:
             if visible:
                 vi = visible.index(pos)
                 pos = visible[min(len(visible)-1, vi+1)]
-            status_rows, status_err = refresh_status_rows(host)
         elif ch == curses.KEY_PPAGE:
             if visible:
                 vi = visible.index(pos)
                 pos = visible[max(0, vi - max(1, list_h - 1))]
-            status_rows, status_err = refresh_status_rows(host)
         elif ch == curses.KEY_NPAGE:
             if visible:
                 vi = visible.index(pos)
                 pos = visible[min(len(visible)-1, vi + max(1, list_h - 1))]
-            status_rows, status_err = refresh_status_rows(host)
         elif ch == curses.KEY_HOME:
             if visible:
                 pos = visible[0]
-            status_rows, status_err = refresh_status_rows(host)
         elif ch == curses.KEY_END:
             if visible:
                 pos = visible[-1]
-            status_rows, status_err = refresh_status_rows(host)
+        elif ch == ord('+'):
+            merge_bucket, msg = toggle_merge_bucket(merge_bucket, rows[pos])
         elif ch in (ord(' '), ord('a')):
             rows[pos]["status"] = "" if rows[pos].get("status") == "approved" else "approved"
         elif ch == ord('1'):
@@ -1200,12 +1768,48 @@ def run(stdscr, rows, host, out, log_path, state_path):
                     # mount_image may print USB0/USB1 fallback notes; capture them so
                     # they do not corrupt the curses screen.
                     captured = io.StringIO()
+                    msg = f"Mounting {rows[pos].get('title') or path}"
+                    stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                    stdscr.refresh()
                     with contextlib.redirect_stdout(captured):
                         status, body = mount_image(host, path, "a")
+                    status_rows, status_err = refresh_status_rows_after_drive_change(host)
+                    draw_drive_status(stdscr, status_y, status_w, status_rows, status_err)
+                    stdscr.refresh()
                     msg = f"Mounted selected image to A/8"
             except Exception as e:
                 msg = f"Mount failed: {clean_msg(e)}"
-            status_rows, status_err = refresh_status_rows(host)
+            # Manual mount refreshed status immediately above on success; on error,
+            # still poll once so the status stack is not stale.
+            if msg.startswith("Mount failed"):
+                status_rows, status_err = refresh_status_rows_after_drive_change(host)
+        elif ch == key_f(10):
+            try:
+                old_pos = pos
+                pos, msg, merge_bucket = image_actions_menu(stdscr, host, rows, pos, cache=cache, bucket=merge_bucket, status_rows=status_rows)
+                rows[pos]["payload"] = payload_for(rows[pos].get("mode", ""), rows[pos].get("path", ""), rows[pos].get("entry", ""))
+                deleted_current = rows[pos].get("storage_status") == "deleted"
+                if pos != old_pos:
+                    # Conversion/merge created or selected a new row. Re-sort the
+                    # in-memory list so it lands where the normal title/path order
+                    # expects, then move the bar back to that same path.
+                    selected_key = row_identity(rows[pos])
+                    rows.sort(key=row_sort_key)
+                    pos = next((i for i, r in enumerate(rows) if row_identity(r) == selected_key), pos)
+                    # Drop active filters so the selection visibly moves to that result.
+                    search_query = ""
+                    sql_filter_keys = None
+                    sql_filter_rank = None
+                    sql_view_name = "All loaded rows"
+                    top = 0
+                save_state(rows, state_path)
+                if deleted_current and rows:
+                    del rows[pos]
+                    pos = min(pos, len(rows) - 1) if rows else 0
+                    top = 0
+            except Exception as e:
+                msg = f"Image action failed: {clean_msg(e)}"
+            status_rows, status_err = refresh_status_rows_after_drive_change(host)
         elif ch == ord('D'):
             msg = "Disk swap workflow is reserved/not implemented yet"
         elif ch == ord('C'):
@@ -1226,10 +1830,32 @@ def run(stdscr, rows, host, out, log_path, state_path):
             captured_out = io.StringIO()
             captured_err = io.StringIO()
             try:
+                def launch_status_callback(event, mounted_path):
+                    nonlocal status_rows, status_err, msg
+                    if event == "mounting":
+                        title = title_from_path(mounted_path or "")
+                        if mounted_path == "/blank.d64":
+                            title = "blank"
+                        msg = f"Mounting {title}"
+                        stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                        stdscr.refresh()
+                    elif event == "mounted":
+                        status_rows, status_err = refresh_status_rows_after_drive_change(host)
+                        draw_drive_status(stdscr, status_y, status_w, status_rows, status_err)
+                        stdscr.refresh()
+                    elif event == "rebooting":
+                        msg = "Rebooting machine"
+                        stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                        stdscr.refresh()
+                    elif event == "go64":
+                        msg = "Switching to C64 mode (GO64)"
+                        stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                        stdscr.refresh()
+
                 with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
                     target_mode = rows[pos].get("machine_mode", "c64") or "c64"
                     skip_prehelp = ch == ord('T')
-                    status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp)
+                    status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status_callback)
                 # Do NOT mark approved/selected here. User must press Space/a after visual confirmation.
                 msg = f"Test launched HTTP {status}: {body.strip()} -- if good, press Space/a to approve"
                 if ch == ord('T'):
@@ -1308,6 +1934,8 @@ def main():
     ap.add_argument("--state", default="curator.db", help="SQLite DB preserving approved/failed/launched/skipped rows")
     ap.add_argument("--include-unsupported", action="store_true", help="show G64/TAP rows too")
     ap.add_argument("--import-approved", action="store_true", help="one-time import approved manifest even when curator state exists, then archive it")
+    ap.add_argument("--no-cache", action="store_true", help="disable session file cache for downloaded/uploaded images")
+    ap.add_argument("--cache-dir", default="auto", help="session cache directory base; default auto uses /dev/shm when available")
     args = ap.parse_args()
     host = discover_ultimate() if args.ultimate == "auto" else args.ultimate
     if not host:
@@ -1352,7 +1980,11 @@ def main():
     if not rows:
         raise SystemExit(f"No supported rows in {args.inventory}")
     rows.sort(key=row_sort_key)
-    result = curses.wrapper(run, rows, host, args.out, args.log, args.state)
+    cache = SessionFileCache(enabled=not args.no_cache, cache_dir=args.cache_dir)
+    try:
+        result = curses.wrapper(run, rows, host, args.out, args.log, args.state, cache)
+    finally:
+        cache.cleanup()
     print(result)
 
 
