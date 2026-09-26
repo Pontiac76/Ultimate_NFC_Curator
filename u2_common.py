@@ -789,7 +789,7 @@ def cold_boot(host):
     return reset_machine(host)
 
 
-def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
+def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64", status_callback=None):
     """Mount a known blank 1541 image, wait, then reset/cold boot.
 
     This gives the U2 a simple/known disk state before the machine reboots.
@@ -797,13 +797,19 @@ def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
     """
     try:
         print(f"STEP mount blank disk before reset: {blank_path}")
+        if status_callback:
+            status_callback("mounting", blank_path)
         status, body = mount_image(host, blank_path, drive)
         print(f"STEP mounted blank: HTTP {status} {body.strip()}")
+        if status_callback:
+            status_callback("mounted", blank_path)
         print("STEP wait 2s for U2 settle")
         time.sleep(2.0)
     except Exception as e:
         print(f"STEP blank disk warning: {e}")
     print("STEP cold boot/reset")
+    if status_callback:
+        status_callback("rebooting", None)
     return cold_boot(host)
 
 
@@ -1596,7 +1602,7 @@ def run_launch_script(host, image_path, machine_mode, script_dir="scripts"):
     return ran
 
 
-def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False):
+def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False, status_callback=None):
     """Cold boot, detect mode, optionally GO64, then mount/load/run a disk image.
 
     entry controls the LOAD target for disk mode. Blank means LOAD"*".
@@ -1612,7 +1618,7 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         unmount_image(host, drive)
     except Exception as e:
         print(f"STEP unmount warning: {e}")
-    settle_with_blank_disk_then_boot(host, drive)
+    settle_with_blank_disk_then_boot(host, drive, status_callback=status_callback)
     print("STEP wait for BASIC READY after reset")
     if not wait_for_screen_text(host, "READY", timeout=12.0):
         print("STEP READY not detected; falling back to 3s reset delay")
@@ -1631,6 +1637,8 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         if not wait_for_screen_text(host, "READY", timeout=8.0):
             print("STEP READY not detected before GO64; proceeding anyway")
         print("STEP request C64 mode: go64")
+        if status_callback:
+            status_callback("go64", None)
         inject_keys(host, "go64\r", machine_mode="c128")
         print("STEP wait for GO64 confirmation prompt")
         if not wait_for_screen_text(host, "ARE YOU SURE", timeout=8.0):
@@ -1650,8 +1658,12 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         active_mode = detected["mode"] if detected["mode"] in ("c64", "c128") else target_mode
 
     print("STEP mount image")
+    if status_callback:
+        status_callback("mounting", image_path)
     status, body = mount_image(host, image_path, drive)
     print(f"STEP mounted image for {target_mode}: HTTP {status} {body.strip()}")
+    if status_callback:
+        status_callback("mounted", image_path)
 
     load_target = entry or "*"
     print(f'STEP send LOAD command: lO"{load_target}",8,1')
@@ -1687,7 +1699,7 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
     return status, body
 
 
-def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False):
+def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False, status_callback=None):
     if not payload.startswith("U2+:"):
         raise RuntimeError("Payload does not start with U2+:")
     mode, rest = payload[4:].split(":", 1)
@@ -1711,7 +1723,7 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
     if mode in ("d64", "disk"):
         image_exts = (".d64", ".d71", ".d81")
         if lower.endswith(image_exts):
-            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp)
+            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp, status_callback=status_callback)
         if lower.endswith((".g64", ".tap")):
             raise RuntimeError("G64/TAP launch is intentionally unsupported for now")
     raise RuntimeError(f"Unsupported launch mode {mode!r} for path {path!r}")

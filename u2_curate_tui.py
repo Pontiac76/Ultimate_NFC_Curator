@@ -1141,12 +1141,23 @@ def refresh_status_rows(host):
         return [], f"Drive status unavailable: {e}"
 
 
+def refresh_status_rows_after_drive_change(host):
+    # U2 drive state can lag just behind a successful mount/remove API response.
+    # Give firmware a brief moment, then poll once for the status bar.
+    time.sleep(0.25)
+    return refresh_status_rows(host)
+
+
 def draw_drive_status(stdscr, y, w, rows, err=None):
     if err:
         stdscr.addnstr(y, 0, err, w-1, curses.color_pair(3) if curses.has_colors() else 0)
         return 1
     for offset, (label, bus, enabled, dtype, mounted, last_error) in enumerate(rows[:3]):
         x = 0
+        # Clear the whole status row before repainting; mounted paths can shrink
+        # between updates (/long/image.d64 -> /blank.d64), leaving stale suffixes.
+        stdscr.move(y + offset, 0)
+        stdscr.clrtoeol()
         name = f"Drive {label}/{bus:>2}: "
         stdscr.addnstr(y + offset, x, name, max(0, w-1-x)); x += len(name)
         state_word = "Enabled" if enabled else "Disabled"
@@ -1757,12 +1768,21 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                     # mount_image may print USB0/USB1 fallback notes; capture them so
                     # they do not corrupt the curses screen.
                     captured = io.StringIO()
+                    msg = f"Mounting {rows[pos].get('title') or path}"
+                    stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                    stdscr.refresh()
                     with contextlib.redirect_stdout(captured):
                         status, body = mount_image(host, path, "a")
+                    status_rows, status_err = refresh_status_rows_after_drive_change(host)
+                    draw_drive_status(stdscr, status_y, status_w, status_rows, status_err)
+                    stdscr.refresh()
                     msg = f"Mounted selected image to A/8"
             except Exception as e:
                 msg = f"Mount failed: {clean_msg(e)}"
-            status_rows, status_err = refresh_status_rows(host)
+            # Manual mount refreshed status immediately above on success; on error,
+            # still poll once so the status stack is not stale.
+            if msg.startswith("Mount failed"):
+                status_rows, status_err = refresh_status_rows_after_drive_change(host)
         elif ch == key_f(10):
             try:
                 old_pos = pos
@@ -1789,7 +1809,7 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                     top = 0
             except Exception as e:
                 msg = f"Image action failed: {clean_msg(e)}"
-            status_rows, status_err = refresh_status_rows(host)
+            status_rows, status_err = refresh_status_rows_after_drive_change(host)
         elif ch == ord('D'):
             msg = "Disk swap workflow is reserved/not implemented yet"
         elif ch == ord('C'):
@@ -1810,10 +1830,32 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
             captured_out = io.StringIO()
             captured_err = io.StringIO()
             try:
+                def launch_status_callback(event, mounted_path):
+                    nonlocal status_rows, status_err, msg
+                    if event == "mounting":
+                        title = title_from_path(mounted_path or "")
+                        if mounted_path == "/blank.d64":
+                            title = "blank"
+                        msg = f"Mounting {title}"
+                        stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                        stdscr.refresh()
+                    elif event == "mounted":
+                        status_rows, status_err = refresh_status_rows_after_drive_change(host)
+                        draw_drive_status(stdscr, status_y, status_w, status_rows, status_err)
+                        stdscr.refresh()
+                    elif event == "rebooting":
+                        msg = "Rebooting machine"
+                        stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                        stdscr.refresh()
+                    elif event == "go64":
+                        msg = "Switching to C64 mode (GO64)"
+                        stdscr.addnstr(h-1, 0, f"{msg:<{max(1, footer_w-1)}}", footer_w-1)
+                        stdscr.refresh()
+
                 with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
                     target_mode = rows[pos].get("machine_mode", "c64") or "c64"
                     skip_prehelp = ch == ord('T')
-                    status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp)
+                    status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status_callback)
                 # Do NOT mark approved/selected here. User must press Space/a after visual confirmation.
                 msg = f"Test launched HTTP {status}: {body.strip()} -- if good, press Space/a to approve"
                 if ch == ord('T'):
