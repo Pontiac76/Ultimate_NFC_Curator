@@ -14,7 +14,27 @@ import termios
 import time
 from pathlib import Path
 from u2_common import *
-from u2_assembly64 import Assembly64Client, build_aql, db_connect as a64_db_connect, ensure_a64_tables, upsert_result as a64_upsert_result, upsert_entry as a64_upsert_entry, record_entries_check as a64_record_entries_check, safe_inbox_filename, entry_type_summary, file_set_label, LAUNCHABLE_TYPES, REFERENCE_ONLY_TYPES, DEFAULT_INBOX
+from u2_a64_client import Assembly64Client, build_aql, safe_inbox_filename, entry_type_summary, file_set_label, LAUNCHABLE_TYPES, REFERENCE_ONLY_TYPES, DEFAULT_INBOX
+from u2_a64_db import db_connect as a64_db_connect, ensure_a64_tables, upsert_result as a64_upsert_result, upsert_entry as a64_upsert_entry, record_entries_check as a64_record_entries_check
+from u2_image_conversion import conversion_targets, run_local_conversion_action
+from u2_image_actions import convert_curated_image, delete_curated_image, remove_row_by_path
+from u2_tui_widgets import choose_menu, confirm_action, popup_multi_select, prompt_line, prompt_yes_no, show_error_popup, show_local_file_viewer
+from u2_a64_workflow import (
+    a64_inbox_files,
+    a64_record_local_candidate,
+    a64_bucket,
+    clear_a64_entry_state,
+    clear_a64_inbox,
+    is_a64_row,
+    is_local_a64_row,
+    mode_for_ext,
+    normalize_a64_search_value,
+    promote_a64_candidate as promote_a64_candidate_workflow,
+    reconcile_a64_inbox,
+    safe_filename_title,
+    suggested_a64_promote_path,
+    update_a64_entry_state,
+)
 try:
     from u2_nfc_launcher import open_serial, require_response, find_tag, read_ntag_memory, parse_ndef_tlv, decode_first_ndef_text_or_uri
 except Exception:
@@ -70,6 +90,17 @@ def save_tui_state(**updates):
     state = load_tui_state()
     state.update(updates)
     TUI_STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def last_a64_search_defaults():
+    data = load_tui_state().get("a64_search_defaults", {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_a64_search_defaults(data):
+    allowed = {"name", "types", "category", "subcat", "repo", "group", "handle", "sort", "order", "latest"}
+    clean = {k: str(v or "") for k, v in dict(data or {}).items() if k in allowed}
+    save_tui_state(a64_search_defaults=clean)
 
 
 def is_supported_row(row):
@@ -599,18 +630,6 @@ def show_disk_directory(stdscr, host, row, allow_select=False):
             top = max_top
 
 
-def prompt_line(stdscr, prompt, default="", max_len=120):
-    h, w = stdscr.getmaxyx()
-    curses.echo(); curses.curs_set(1)
-    stdscr.move(h-1, 0); stdscr.clrtoeol()
-    full = f"{prompt} [{default}]: " if default else f"{prompt}: "
-    stdscr.addnstr(h-1, 0, full, w-1)
-    stdscr.refresh()
-    text = stdscr.getstr(h-1, min(len(full), w-2), max_len).decode(errors="replace").strip()
-    curses.noecho(); curses.curs_set(0)
-    return text if text else default
-
-
 def a64_pick_value(current, values):
     if not values:
         return current
@@ -619,64 +638,6 @@ def a64_pick_value(current, values):
         return values[(idx + 1) % len(values)]
     except ValueError:
         return values[0]
-
-
-def popup_multi_select(stdscr, title, values, selected_csv=""):
-    values = [v for v in values if v]
-    selected = {v.strip() for v in str(selected_csv or "").split(",") if v.strip()}
-    pos = 0
-    top = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        width = min(w - 4, max(44, len(title) + 4, *(len(v) + 8 for v in values)) if values else 44)
-        height = min(h - 2, max(6, min(len(values) + 4, h - 2)))
-        body_h = max(1, height - 4)
-        if pos < top:
-            top = pos
-        if pos >= top + body_h:
-            top = pos - body_h + 1
-        top = max(0, min(top, max(0, len(values) - body_h)))
-        y0 = max(0, (h - height) // 2)
-        x0 = max(0, (w - width) // 2)
-        win = curses.newwin(height, width, y0, x0)
-        win.keypad(True)
-        win.box()
-        win.addnstr(1, 2, title, width - 4, curses.A_BOLD)
-        if not values:
-            win.addnstr(2, 2, "No options available", width - 4, curses.A_DIM)
-        for row_y, idx in enumerate(range(top, min(len(values), top + body_h)), start=2):
-            v = values[idx]
-            mark = "[x]" if v in selected else "[ ]"
-            attr = curses.A_REVERSE if idx == pos else 0
-            win.addnstr(row_y, 2, f"{mark} {v}", width - 4, attr)
-        footer = "Space toggle  Enter OK  c clear  q cancel"
-        win.addnstr(height - 1, 2, footer, width - 4, curses.A_DIM)
-        win.refresh()
-        ch = win.getch()
-        if ch in (ord('q'), ord('Q'), 27):
-            return None
-        if ch == curses.KEY_UP:
-            pos = max(0, pos - 1)
-        elif ch == curses.KEY_DOWN:
-            pos = min(len(values) - 1, pos + 1)
-        elif ch == curses.KEY_PPAGE:
-            pos = max(0, pos - body_h)
-        elif ch == curses.KEY_NPAGE:
-            pos = min(len(values) - 1, pos + body_h)
-        elif ch == curses.KEY_HOME:
-            pos = 0
-        elif ch == curses.KEY_END:
-            pos = max(0, len(values) - 1)
-        elif ch == ord('c'):
-            selected.clear()
-        elif ch == ord(' ') and values:
-            v = values[pos]
-            if v in selected:
-                selected.remove(v)
-            else:
-                selected.add(v)
-        elif ch in (10, 13):
-            return ",".join(v for v in values if v in selected)
 
 
 def a64_search_form(stdscr, defaults=None):
@@ -751,96 +712,6 @@ def a64_search_form(stdscr, defaults=None):
             return data
 
 
-def is_a64_row(row):
-    return bool(row.get("a64_id") and row.get("a64_category") is not None and row.get("entry_index") is not None)
-
-
-def is_local_a64_row(row):
-    p = str(row.get("path") or "")
-    return is_a64_row(row) and p and not p.startswith("/") and Path(p).exists()
-
-
-def normalize_a64_search_value(value):
-    return str(value or "").strip().lower()
-
-
-def update_a64_entry_state(db_path, row, state):
-    if not is_a64_row(row):
-        return False
-    col = {
-        "failed": "failed_at",
-        "deleted": "deleted_at",
-        "discarded": "discarded_at",
-        "promoted": "promoted_at",
-        "tested": "tested_at",
-    }.get(state)
-    if not col:
-        return False
-    with a64_db_connect(db_path) as conn:
-        conn.execute(
-            f"""
-            UPDATE A64Entry
-            SET {col}=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-            WHERE pk_ID IN (
-              SELECT e.pk_ID FROM A64Entry e
-              JOIN A64Result r ON r.pk_ID=e.fk_A64Result_ID
-              WHERE r.a64_id=? AND r.a64_category=? AND e.entry_index=?
-            )
-            """,
-            (str(row.get("a64_id")), int(row.get("a64_category") or 0), int(row.get("entry_index") or 0)),
-        )
-    row["status"] = state
-    row["a64_status"] = state
-    return True
-
-
-def safe_filename_title(title):
-    s = re.sub(r"[^A-Za-z0-9 _.-]+", "_", str(title or "")).strip(" ._")
-    s = re.sub(r"\s+", "_", s)
-    return s or "A64_Image"
-
-
-def a64_bucket(title):
-    s = safe_filename_title(title)
-    ch = s[0].upper() if s else "#"
-    return ch if "A" <= ch <= "Z" else "#"
-
-
-def suggested_a64_promote_path(row):
-    title = row.get("title") or Path(row.get("original_filename") or row.get("path", "A64_Image")).stem
-    safe_title = safe_filename_title(title)
-    a64_id = str(row.get("a64_id") or "a64")
-    short_id = a64_id if len(a64_id) <= 12 else a64_id[:12]
-    ext = Path(row.get("path") or row.get("original_filename") or "").suffix.lower() or ".bin"
-    return f"/Usb0/A64/{a64_bucket(safe_title)}/{safe_title}-{short_id}{ext}"
-
-
-def mode_for_ext(ext):
-    ext = ext.lower().lstrip(".")
-    if ext in ("d64", "d71", "d81", "g64"):
-        return "disk"
-    if ext == "crt":
-        return "crt"
-    if ext == "sid":
-        return "sid"
-    if ext == "tap":
-        return "tap"
-    return "prg"
-
-
-def mark_image_deleted(db_path, image_path, reason="Deleted from TUI"):
-    with sqlite_connect(db_path) as conn:
-        ensure_rows_table(conn)
-        conn.execute(
-            """
-            UPDATE Image
-            SET fk_StorageStatus_ID=?, deleted_reason=?, deleted_at=CURRENT_TIMESTAMP
-            WHERE path=?
-            """,
-            (lookup_id(conn, "StorageStatus", "deleted"), reason, image_path),
-        )
-
-
 def delete_curator_image(stdscr, host, db_path, row, base_rows):
     path = row.get("path", "")
     title = row.get("title", "") or path
@@ -849,159 +720,9 @@ def delete_curator_image(stdscr, host, db_path, row, base_rows):
     detail = f"Delete curated image: {title}\n\nU2 path: {path}\n\nThis removes the file from the U2 and marks the DB row deleted."
     if not confirm_action(stdscr, "Delete curated image", detail):
         return False, "Delete cancelled"
-    try:
-        ftp_delete(host, path)
-    except Exception:
-        # If the file is already gone, still mark the DB deleted.
-        pass
-    mark_image_deleted(db_path, path)
-    for i, r in enumerate(list(base_rows)):
-        if r.get("path") == path:
-            del base_rows[i]
-            break
+    delete_curated_image(host, db_path, path)
+    remove_row_by_path(base_rows, path)
     return True, f"Deleted curated image: {title}"
-
-
-def a64_record_local_candidate(db_path, local_path, title, source_row, file_type=None):
-    p = Path(local_path)
-    ext = (file_type or p.suffix.lower().lstrip(".") or "other")
-    source_id = str(source_row.get("a64_id") or "local")
-    result = {
-        "id": f"{source_id}-local-{p.stem}",
-        "category": int(source_row.get("a64_category") or 0),
-        "name": title,
-        "group": source_row.get("group_name", ""),
-        "year": int(source_row.get("year") or 0),
-    }
-    entry = type("Entry", (), {
-        "entry_index": 0,
-        "path": p.name,
-        "suffix": ext,
-        "size": p.stat().st_size if p.exists() else None,
-        "date": None,
-        "raw": {"path": p.name, "id": 0, "size": p.stat().st_size if p.exists() else None, "derived_from": source_id},
-    })()
-    with a64_db_connect(db_path) as conn:
-        result_pk = a64_upsert_result(conn, result)
-        entry_pk = a64_upsert_entry(conn, result_pk, entry, str(p))
-        conn.execute("UPDATE A64Entry SET title=?, deleted_at=NULL, discarded_at=NULL, failed_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE pk_ID=?", (title, entry_pk))
-
-
-def create_local_prg_image(local_prg, target_ext, title, output_dir=DEFAULT_INBOX):
-    if not c1541_available():
-        raise RuntimeError("c1541 is not installed")
-    local_prg = Path(local_prg)
-    out = Path(output_dir) / f"{local_prg.stem}.converted.{target_ext}"
-    tmp = tempfile.NamedTemporaryFile(suffix=f".{target_ext}", delete=False)
-    tmp.close()
-    os.unlink(tmp.name)
-    disk_type = target_ext.lower()
-    disk_title = safe_filename_title(title)[:16] or "a64"
-    try:
-        r = subprocess.run(["c1541", "-format", f"{disk_title},64", disk_type, tmp.name, "-write", str(local_prg), local_prg.stem[:16]], text=True, capture_output=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError((r.stderr or r.stdout or "c1541 conversion failed").strip())
-        shutil.move(tmp.name, out)
-        return out
-    finally:
-        try:
-            os.unlink(tmp.name)
-        except FileNotFoundError:
-            pass
-
-
-def convert_local_disk_image(local_disk, target_ext, title, output_dir=DEFAULT_INBOX):
-    if not c1541_available():
-        raise RuntimeError("c1541 is not installed")
-    local_disk = Path(local_disk)
-    src_info = c1541_directory_from_file(local_disk)
-    out = Path(output_dir) / f"{local_disk.stem}.converted.{target_ext}"
-    tmpdir = Path(tempfile.mkdtemp(prefix="a64_convert_"))
-    tmpout = tempfile.NamedTemporaryFile(suffix=f".{target_ext}", delete=False)
-    tmpout.close(); os.unlink(tmpout.name)
-    try:
-        disk_title = safe_filename_title(src_info.get("disk_name") or title)[:16] or "a64"
-        r = subprocess.run(["c1541", "-format", f"{disk_title},64", target_ext, tmpout.name], text=True, capture_output=True, timeout=60)
-        if r.returncode != 0:
-            raise RuntimeError((r.stderr or r.stdout or "c1541 format failed").strip())
-        for e in src_info.get("entries", []):
-            if e.get("type") != "PRG":
-                continue
-            name = e.get("name", "")
-            host_file = tmpdir / re.sub(r"[^A-Za-z0-9._-]+", "_", name or "entry.prg")
-            r = subprocess.run(["c1541", str(local_disk), "-read", name, str(host_file)], text=True, capture_output=True, timeout=60)
-            if r.returncode != 0 or not host_file.exists():
-                continue
-            r = subprocess.run(["c1541", tmpout.name, "-write", str(host_file), name], text=True, capture_output=True, timeout=60)
-            if r.returncode != 0:
-                raise RuntimeError((r.stderr or r.stdout or f"c1541 write failed for {name}").strip())
-        shutil.move(tmpout.name, out)
-        return out
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        try:
-            os.unlink(tmpout.name)
-        except FileNotFoundError:
-            pass
-
-
-def choose_menu(stdscr, title, items):
-    """Popup menu used by image actions. Return selected item dict, or None."""
-    enabled_positions = [i for i, item in enumerate(items) if item.get("enabled", True)]
-    if not enabled_positions:
-        return None
-    pos = enabled_positions[0]
-    top = 0
-    while True:
-        h, w = stdscr.getmaxyx()
-        width = min(w - 4, max(48, len(title) + 4, *(len(it.get("label", "")) + len(it.get("hint", "")) + 8 for it in items)))
-        height = min(h - 2, len(items) + 4)
-        body_h = max(1, height - 3)
-        if pos < top:
-            top = pos
-        if pos >= top + body_h:
-            top = pos - body_h + 1
-        top = max(0, min(top, max(0, len(items) - body_h)))
-        y0 = max(0, (h - height) // 2)
-        x0 = max(0, (w - width) // 2)
-        win = curses.newwin(height, width, y0, x0)
-        win.keypad(True)
-        win.box()
-        win.addnstr(1, 2, title, width - 4, curses.A_BOLD)
-        for row_y, item_idx in enumerate(range(top, min(len(items), top + body_h)), start=2):
-            item = items[item_idx]
-            hint = f"  {item.get('hint')}" if item.get("hint") else ""
-            line = f"{item.get('label','')}{hint}"
-            attr = curses.A_REVERSE if item_idx == pos else 0
-            if not item.get("enabled", True):
-                attr |= curses.A_DIM
-            win.addnstr(row_y, 2, line, width - 4, attr)
-        if len(items) > body_h:
-            win.addnstr(height - 1, 2, f"{top+1}-{min(len(items), top+body_h)}/{len(items)}", width - 4, curses.A_DIM)
-        win.refresh()
-        ch = win.getch()
-        if ch in (ord('q'), ord('Q'), 27):
-            return None
-        if ch == curses.KEY_UP:
-            candidates = [i for i in enabled_positions if i < pos]
-            pos = candidates[-1] if candidates else enabled_positions[-1]
-        elif ch == curses.KEY_DOWN:
-            candidates = [i for i in enabled_positions if i > pos]
-            pos = candidates[0] if candidates else enabled_positions[0]
-        elif ch == curses.KEY_PPAGE:
-            pos = enabled_positions[max(0, enabled_positions.index(pos) - body_h)]
-        elif ch == curses.KEY_NPAGE:
-            pos = enabled_positions[min(len(enabled_positions) - 1, enabled_positions.index(pos) + body_h)]
-        elif ch in (10, 13):
-            return items[pos] if items[pos].get("enabled", True) else None
-
-
-def conversion_targets(file_type):
-    return {
-        "prg": ["d64", "d71", "d81"],
-        "d64": ["d71", "d81"],
-        "d71": ["d81"],
-    }.get(str(file_type).lower().lstrip("."), [])
 
 
 def image_action_items_for_row(row, *, backend="u2"):
@@ -1016,19 +737,9 @@ def image_action_items_for_row(row, *, backend="u2"):
         ]
     return [
         {"label": f"Convert {ft.upper()} to...", "action": "convert", "enabled": bool(targets)},
-        {"label": f"Extract PRG from {ft.upper()}...", "action": "extract", "enabled": ft in ("d64", "d71", "d81")},
+        {"label": f"Extract PRG from {ft.upper()}...", "action": "extract", "enabled": False, "hint": "reserved for U2 images" if ft in ("d64", "d71", "d81") else "not available"},
         {"label": "Delete image...", "action": "delete", "enabled": True},
     ]
-
-
-def run_local_conversion_action(local, row, target, output_dir=DEFAULT_INBOX):
-    ft = Path(local).suffix.lower().lstrip(".")
-    title = row.get("title") or Path(local).stem
-    if ft == "prg":
-        return create_local_prg_image(local, target, title, output_dir=output_dir)
-    if ft in ("d64", "d71"):
-        return convert_local_disk_image(local, target, title, output_dir=output_dir)
-    raise RuntimeError(f"{ft.upper()} conversion reserved")
 
 
 def normal_image_actions_menu(stdscr, host, state_path, row, base_rows):
@@ -1039,7 +750,25 @@ def normal_image_actions_menu(stdscr, host, state_path, row, base_rows):
         ok, message = delete_curator_image(stdscr, host, state_path, row, base_rows)
         return message
     if chosen["action"] == "convert":
-        return "Conversion for U2 images is not available on this branch yet"
+        ft = (row.get("file_type") or row.get("type") or Path(row.get("path", "")).suffix.lstrip(".")).lower()
+        targets = conversion_targets(ft)
+        sub = choose_menu(stdscr, f"Convert {ft.upper()} to...", [{"label": t.upper(), "target": t} for t in targets])
+        if not sub:
+            return "Conversion cancelled"
+        target = sub["target"]
+        h, w = stdscr.getmaxyx()
+        stdscr.move(h - 1, 0)
+        stdscr.clrtoeol()
+        attr = curses.A_BOLD | (curses.color_pair(5) if curses.has_colors() else 0)
+        stdscr.addnstr(h - 1, 0, f"Converting/uploading {row.get('title') or row.get('path')} to {target.upper()}...", w - 1, attr)
+        stdscr.refresh()
+        image_path, new_row = convert_curated_image(host, state_path, row, target)
+        existing = next((r for r in base_rows if r.get("path") == image_path), None)
+        if existing:
+            existing.update(new_row)
+        else:
+            base_rows.append(new_row)
+        return f"Converted image created: {image_path}"
     if chosen["action"] == "extract":
         return "Extract PRG is not available on this branch yet"
     return "Action reserved"
@@ -1098,94 +827,21 @@ def promote_a64_candidate(stdscr, host, db_path, row, base_rows):
     dest = prompt_line(stdscr, "U2 destination path", suggested, 220)
     if not dest:
         raise RuntimeError("Promotion cancelled: no destination")
-    if not dest.startswith("/"):
-        dest = "/Usb0/" + dest.lstrip("/")
-    data = local.read_bytes()
+
     h, w = stdscr.getmaxyx()
     stdscr.move(h - 1, 0)
     stdscr.clrtoeol()
     attr = curses.A_BOLD | (curses.color_pair(5) if curses.has_colors() else 0)
     stdscr.addnstr(h - 1, 0, f"Uploading promoted file to U2: {dest}", w - 1, attr)
     stdscr.refresh()
-    uploaded = ftp_upload(host, dest, data)
-    image_path = strip_usb_prefix(uploaded)
-    ext = local.suffix.lower().lstrip(".")
-    mode = mode_for_ext(ext)
-    notes = f"A64 id={row.get('a64_id')} category={row.get('a64_category')} entry={row.get('entry_index')} original={row.get('original_filename') or local.name}"
-    payload = payload_for(mode, image_path, "")
-    with sqlite_connect(db_path) as conn:
-        ensure_rows_table(conn)
-        vals = {
-            "title": title,
-            "path": image_path,
-            "payload": payload,
-            "entry": "",
-            "detail": f"A64 promoted {ext.upper()}",
-            "notes": notes,
-            "quarantine_reason": "",
-            "deleted_reason": "",
-            "quarantined": 0,
-            "fk_Status_ID": lookup_id(conn, "Status", "approved"),
-            "fk_StorageStatus_ID": lookup_id(conn, "StorageStatus", "present"),
-            "fk_MachineMode_ID": lookup_id(conn, "MachineMode", row.get("machine_mode") or "c64"),
-            "fk_FileType_ID": lookup_id(conn, "FileType", ext),
-            "fk_LaunchMode_ID": lookup_id(conn, "LaunchMode", mode),
-        }
-        cols = ", ".join(vals)
-        placeholders = ", ".join("?" for _ in vals)
-        updates = ", ".join(f"{k}=excluded.{k}" for k in vals if k != "path")
-        conn.execute(
-            f"INSERT INTO Image ({cols}) VALUES ({placeholders}) ON CONFLICT(path) DO UPDATE SET {updates}",
-            list(vals.values()),
-        )
-    with a64_db_connect(db_path) as conn:
-        conn.execute(
-            """
-            UPDATE A64Entry
-            SET promoted_path=?, promoted_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-            WHERE pk_ID IN (
-              SELECT e.pk_ID FROM A64Entry e JOIN A64Result r ON r.pk_ID=e.fk_A64Result_ID
-              WHERE r.a64_id=? AND r.a64_category=? AND e.entry_index=?
-            )
-            """,
-            (image_path, str(row.get("a64_id")), int(row.get("a64_category") or 0), int(row.get("entry_index") or 0)),
-        )
-    try:
-        local.unlink()
-    except FileNotFoundError:
-        pass
-    new_row = {"title": title, "path": image_path, "payload": payload, "mode": mode, "entry": "", "machine_mode": row.get("machine_mode") or "c64", "file_type": ext, "type": ext, "detail": f"A64 promoted {ext.upper()}", "status": "approved", "storage_status": "present", "notes": notes}
+
+    image_path, new_row = promote_a64_candidate_workflow(host, db_path, row, title, dest)
     existing = next((r for r in base_rows if r.get("path") == image_path), None)
     if existing:
         existing.update(new_row)
     else:
         base_rows.append(new_row)
-    row["promoted_path"] = image_path
-    row["promoted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    row["status"] = "promoted"
-    row["a64_status"] = "promoted"
     return image_path, new_row
-
-
-def clear_a64_entry_state(db_path, row):
-    if not is_a64_row(row):
-        return False
-    with a64_db_connect(db_path) as conn:
-        conn.execute(
-            """
-            UPDATE A64Entry
-            SET failed_at=NULL, discarded_at=NULL, deleted_at=NULL, tested_at=NULL, updated_at=CURRENT_TIMESTAMP
-            WHERE pk_ID IN (
-              SELECT e.pk_ID FROM A64Entry e
-              JOIN A64Result r ON r.pk_ID=e.fk_A64Result_ID
-              WHERE r.a64_id=? AND r.a64_category=? AND e.entry_index=?
-            )
-            """,
-            (str(row.get("a64_id")), int(row.get("a64_category") or 0), int(row.get("entry_index") or 0)),
-        )
-    row["status"] = "downloaded" if row.get("downloaded_at") else "seen"
-    row["a64_status"] = row["status"]
-    return True
 
 
 def a64_scratch_remote_candidates(row, local):
@@ -1383,106 +1039,6 @@ def a64_result_marker_map(state_path, results):
     return out
 
 
-def a64_inbox_files():
-    root = DEFAULT_INBOX
-    if not root.exists():
-        return []
-    return sorted(p for p in root.iterdir() if p.is_file())
-
-
-def reconcile_a64_inbox(state_path):
-    files = a64_inbox_files()
-    pat = re.compile(r"^(.+?)_(\d+)_(\d+)_(.+)$")
-    with a64_db_connect(state_path) as conn:
-        for p in files:
-            conn.execute(
-                "UPDATE A64Entry SET deleted_at=NULL, discarded_at=NULL, failed_at=NULL, updated_at=CURRENT_TIMESTAMP WHERE local_path=?",
-                (str(p),),
-            )
-            if ".converted." in p.name:
-                # Converted files are recorded as derived local pseudo-results by
-                # a64_record_local_candidate(). Do not parse their source-like
-                # prefix (e.g. 5076_16_0_MULE.converted.d71) as the original
-                # A64 identity and overwrite the source entry.
-                continue
-            m = pat.match(p.name)
-            if not m:
-                continue
-            rid, cat, idx, original = m.groups()
-            result = {"id": rid, "category": int(cat), "name": Path(original).stem}
-            result_pk = a64_upsert_result(conn, result)
-            entry = type("Entry", (), {
-                "entry_index": int(idx),
-                "path": original,
-                "suffix": Path(original).suffix.lower().lstrip(".") or "other",
-                "size": p.stat().st_size,
-                "date": None,
-                "raw": {"path": original, "id": int(idx), "size": p.stat().st_size},
-            })()
-            a64_upsert_entry(conn, result_pk, entry, str(p))
-    return files
-
-
-def clear_a64_inbox(state_path):
-    files = a64_inbox_files()
-    paths = [str(p) for p in files]
-    for p in files:
-        try:
-            p.unlink()
-        except FileNotFoundError:
-            pass
-    if paths:
-        with a64_db_connect(state_path) as conn:
-            conn.executemany(
-                "UPDATE A64Entry SET deleted_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE local_path=?",
-                [(p,) for p in paths],
-            )
-    return len(paths)
-
-
-def prompt_yes_no(stdscr, title, detail, default_no=True):
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-    lines = [title, ""] + str(detail).splitlines() + ["", "Answer [y/N]:" if default_no else "Answer [Y/n]:"]
-    for y, line in enumerate(lines[:h-2]):
-        stdscr.move(y, 0)
-        stdscr.clrtoeol()
-        stdscr.addnstr(y, 0, line, w-1, curses.A_BOLD if y == 0 else 0)
-    curses.echo(); curses.curs_set(1)
-    prompt_y = min(len(lines), h-1)
-    prompt = "Confirm: "
-    stdscr.move(prompt_y, 0)
-    stdscr.clrtoeol()
-    stdscr.addnstr(prompt_y, 0, prompt, w-1)
-    stdscr.refresh()
-    ans = stdscr.getstr(prompt_y, len(prompt), 20).decode(errors="replace").strip().lower()
-    curses.noecho(); curses.curs_set(0)
-    if not ans:
-        return not default_no
-    return ans in ("y", "yes")
-
-
-def confirm_action(stdscr, title, detail, yes_text="y"):
-    stdscr.erase()
-    h, w = stdscr.getmaxyx()
-    detail_lines = str(detail).splitlines()
-    lines = [title, ""] + detail_lines + ["", "Delete? [y/N]"]
-    for y, line in enumerate(lines[:h-2]):
-        stdscr.move(y, 0)
-        stdscr.clrtoeol()
-        stdscr.addnstr(y, 0, line, w-1, curses.A_BOLD if y == 0 else 0)
-    curses.echo(); curses.curs_set(1)
-    prompt_y = min(len(lines), h-1)
-    prompt = "Confirm: "
-    stdscr.move(prompt_y, 0)
-    stdscr.clrtoeol()
-    stdscr.addnstr(prompt_y, 0, prompt, w-1)
-    stdscr.refresh()
-    ans = stdscr.getstr(prompt_y, len(prompt), 20).decode(errors="replace").strip().lower()
-    curses.noecho(); curses.curs_set(0)
-    return ans in ("y", "yes")
-
-
 def prompt_resume_a64_inbox(stdscr, count):
     while True:
         stdscr.erase()
@@ -1545,7 +1101,7 @@ def select_wishlist_item(stdscr, items):
         for y, idx in enumerate(range(top, min(len(items), top + body_h)), start=2):
             attr = curses.A_REVERSE if idx == pos else 0
             stdscr.addnstr(y, 0, items[idx], w-1, attr)
-        footer = "↑/↓ move  Enter search  x remove  q/Esc cancel"
+        footer = "↑/↓ move  Enter search  t top  b bottom  x remove  q/Esc cancel"
         if len(items) > body_h:
             footer += f"  {top+1}-{min(len(items), top+body_h)}/{len(items)}"
         stdscr.addnstr(h-1, 0, footer, w-1, curses.A_DIM)
@@ -1555,6 +1111,22 @@ def select_wishlist_item(stdscr, items):
             return None
         if ch in (10, 13):
             return items[pos]
+        if ch in (ord('t'), ord('T')):
+            if pos > 0:
+                item = items.pop(pos)
+                items.insert(0, item)
+                save_wishlist(items)
+                pos = 0
+                top = 0
+            continue
+        if ch in (ord('b'), ord('B')):
+            if pos < len(items) - 1:
+                item = items.pop(pos)
+                items.append(item)
+                save_wishlist(items)
+                pos = len(items) - 1
+                top = max(0, len(items) - body_h)
+            continue
         if ch == ord('x'):
             item = items[pos]
             if prompt_yes_no(stdscr, "Remove wishlist item", f"Remove from current wishlist?\n\n{item}\n\nThis does not change wishlist_all.txt.", default_no=True):
@@ -1611,6 +1183,7 @@ def a64_search_flow(stdscr, state_path, initial_data=None):
         data = a64_search_form(stdscr, data)
         if not data:
             return "A64 search cancelled"
+        save_a64_search_defaults(data)
         types = [t.strip() for t in data.get("types", "").split(",") if t.strip()]
         query = build_aql(name=data.get("name", ""), types=types, category=data.get("category", ""), subcat=data.get("subcat", ""), repo=data.get("repo", ""), group=data.get("group", ""), handle=data.get("handle", ""), sort=data.get("sort", ""), order=data.get("order", ""), latest=data.get("latest", ""))
         page_start = 0
@@ -1667,12 +1240,12 @@ def a64_search_flow(stdscr, state_path, initial_data=None):
             if payload_info is None:
                 payload_note = "?"
                 files_attr |= curses.A_DIM
-            elif payload_info.get("http_status") and int(payload_info.get("http_status") or 0) >= 400:
+            elif isinstance(payload_info, dict) and payload_info.get("http_status") and int(payload_info.get("http_status") or 0) >= 400:
                 payload_note = str(payload_info.get("http_status"))
                 if curses.has_colors():
                     files_attr |= curses.color_pair(2)
             else:
-                payload_note = str(payload_info.get("count", 0))
+                payload_note = str(payload_info.get("count", 0)) if isinstance(payload_info, dict) else str(payload_info)
                 if curses.has_colors():
                     files_attr |= curses.color_pair(5)
             stdscr.addnstr(y, 39, f"{payload_note[:7]:<9}", 9, files_attr)
@@ -1684,12 +1257,15 @@ def a64_search_flow(stdscr, state_path, initial_data=None):
                 title += suffix
             stdscr.addnstr(y, 50, title, max(1, w-51), attr)
         stdscr.addnstr(h-2, 0, msg, w-1)
-        footer = "↑/↓ move  Space mark  e entries  d download  a all  n/p page  q/Esc cancel"
+        footer = "↑/↓ move  Space mark  e entries  d download  a all  n/p page  Esc criteria  q cancel"
         stdscr.addnstr(h-1, 0, footer, w-1, curses.A_DIM)
         stdscr.refresh()
         ch = stdscr.getch()
-        if ch in (ord('q'), 27):
+        if ch == ord('q'):
             return "A64 search cancelled"
+        if ch == 27:
+            msg = "Returned to A64 search criteria"
+            break
         if ch == curses.KEY_UP:
             pos = max(0, pos - 1)
         elif ch == curses.KEY_DOWN:
@@ -1732,7 +1308,7 @@ def a64_search_flow(stdscr, state_path, initial_data=None):
                 with a64_db_connect(state_path) as conn:
                     result_pk = a64_upsert_result(conn, r)
                     a64_record_entries_check(conn, result_pk, 200, len(entry_cache[key]))
-                payload_cache[key] = f"{len(entry_cache[key])} file{'s' if len(entry_cache[key]) != 1 else ''} in payload"
+                payload_cache[key] = {"count": len(entry_cache[key]), "http_status": 200}
                 msg = f"Fetched {len(entry_cache[key])} entr{'y' if len(entry_cache[key]) == 1 else 'ies'} for {r.get('name','')}"
             except Exception as e:
                 msg = f"A64 entries failed: {e}"
@@ -1755,7 +1331,7 @@ def a64_search_flow(stdscr, state_path, initial_data=None):
                     with a64_db_connect(state_path) as conn:
                         result_pk = a64_upsert_result(conn, r)
                         a64_record_entries_check(conn, result_pk, 200, len(entries))
-                        payload_cache[key] = f"{len(entries)} file{'s' if len(entries) != 1 else ''} in payload"
+                        payload_cache[key] = {"count": len(entries), "http_status": 200}
                         for e in entries:
                             a64_upsert_entry(conn, result_pk, e)
                     # Download the whole A64 payload, not just U2-launchable files.
@@ -1807,80 +1383,6 @@ def a64_search_flow(stdscr, state_path, initial_data=None):
             if failed:
                 parts.append(f"{failed} result(s) failed")
             return "; ".join(parts)
-
-
-def safe_byte_view_lines(data: bytes, width: int):
-    """Render arbitrary bytes defensively for curses; never emit raw controls."""
-    width = max(1, width)
-    lines = []
-    cur = ""
-    for b in data:
-        if b in (10, 13):
-            if b == 13:
-                continue
-            lines.append(cur)
-            cur = ""
-            continue
-        if b == 9:
-            ch = "    "
-        elif 32 <= b <= 126:
-            ch = chr(b)
-        elif b >= 128:
-            # Latin-1 keeps high-byte docs somewhat readable; nonprintables become dots.
-            ch = bytes([b]).decode("latin-1", "replace")
-            if not ch.isprintable():
-                ch = SAFE_BYTE_DOT
-        else:
-            ch = SAFE_BYTE_DOT
-        for c in ch:
-            if len(cur) >= width:
-                lines.append(cur)
-                cur = ""
-            cur += c if c.isprintable() else SAFE_BYTE_DOT
-    lines.append(cur)
-    return lines or [""]
-
-
-def show_local_file_viewer(stdscr, path):
-    p = Path(path)
-    try:
-        data = p.read_bytes()
-    except Exception as e:
-        show_error_popup(stdscr, "View file", f"Could not read {p}:\n\n{e}")
-        return
-    top = 0
-    while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        header = f"View: {p.name}  {len(data)} bytes"
-        body_h = max(1, h - 3)
-        lines = safe_byte_view_lines(data, max(1, w - 1))
-        max_top = max(0, len(lines) - body_h)
-        top = max(0, min(top, max_top))
-        stdscr.addnstr(0, 0, header, w-1, curses.A_BOLD)
-        stdscr.addnstr(1, 0, "Unsafe/control bytes shown as " + SAFE_BYTE_DOT, w-1, curses.A_DIM)
-        for y, line in enumerate(lines[top:top + body_h], start=2):
-            stdscr.addnstr(y, 0, line, w-1)
-        footer = "↑/↓ scroll  PgUp/PgDn page  Home/End  q/Esc/Enter return"
-        if len(lines) > body_h:
-            footer += f"  {top+1}-{min(len(lines), top+body_h)}/{len(lines)}"
-        stdscr.addnstr(h-1, 0, footer, w-1, curses.A_DIM)
-        stdscr.refresh()
-        ch = stdscr.getch()
-        if ch in (ord('q'), 27, 10, 13):
-            return
-        if ch == curses.KEY_UP:
-            top -= 1
-        elif ch == curses.KEY_DOWN:
-            top += 1
-        elif ch == curses.KEY_PPAGE:
-            top -= body_h
-        elif ch == curses.KEY_NPAGE:
-            top += body_h
-        elif ch == curses.KEY_HOME:
-            top = 0
-        elif ch == curses.KEY_END:
-            top = max_top
 
 
 def show_help(stdscr):
@@ -2121,6 +1623,14 @@ def row_sort_key(row):
     )
 
 
+def load_active_curator_rows(db_path):
+    rows = read_csv(db_path)
+    rows = [r for r in rows if str(r.get("storage_status") or "present").lower() != "deleted"]
+    rows = [r for r in rows if is_supported_row(r)]
+    rows.sort(key=row_sort_key)
+    return rows
+
+
 def row_matches_search(row, query):
     if not query:
         return True
@@ -2165,43 +1675,6 @@ def load_sql_view_choices():
             except Exception:
                 pass
     return choices
-
-
-def show_error_popup(stdscr, title, message):
-    lines = [title, ""] + str(message).splitlines() + ["", "Press any key to continue."]
-    top = 0
-    while True:
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        body_h = max(1, h - 1)
-        max_top = max(0, len(lines) - body_h)
-        top = max(0, min(top, max_top))
-        for y, line in enumerate(lines[top:top + body_h]):
-            abs_i = top + y
-            attr = curses.A_BOLD if abs_i == 0 else 0
-            if abs_i == 0 and curses.has_colors():
-                attr |= curses.color_pair(2)
-            stdscr.addnstr(y, 0, line, w-1, attr)
-        footer = "↑/↓ scroll  PgUp/PgDn page  Home/End  any key return"
-        if len(lines) > body_h:
-            footer += f"  {top+1}-{min(len(lines), top+body_h)}/{len(lines)}"
-        stdscr.addnstr(h-1, 0, footer, w-1, curses.A_DIM)
-        stdscr.refresh()
-        ch = stdscr.getch()
-        if ch == curses.KEY_UP:
-            top -= 1
-        elif ch == curses.KEY_DOWN:
-            top += 1
-        elif ch == curses.KEY_PPAGE:
-            top -= body_h
-        elif ch == curses.KEY_NPAGE:
-            top += body_h
-        elif ch == curses.KEY_HOME:
-            top = 0
-        elif ch == curses.KEY_END:
-            top = max_top
-        else:
-            return
 
 
 def select_sql_view(stdscr, current_name="All loaded rows"):
@@ -2378,12 +1851,18 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg=""):
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        title = "Ultimate2+ C64 curator"
-        if sql_view_name != "All loaded rows":
-            title += f"  view:{sql_view_name}"
-        if search_query:
-            title += f"  /{search_query}"
-        stdscr.addnstr(0, 0, title, w-1, curses.A_BOLD)
+        view_label = "Default" if sql_view_name == "All loaded rows" else sql_view_name
+        title_prefix = "Ultimate2+ C64 curator"
+        view_text = f"  view:{view_label}"
+        search_text = f"  /{search_query}" if search_query else ""
+        title_attr = curses.A_BOLD | (curses.color_pair(3) if curses.has_colors() else 0)
+        view_attr = curses.A_BOLD | (curses.color_pair(5) if curses.has_colors() else 0)
+        stdscr.addnstr(0, 0, title_prefix, w-1, title_attr)
+        if len(title_prefix) < w - 1:
+            stdscr.addnstr(0, len(title_prefix), view_text, max(0, w-1-len(title_prefix)), view_attr)
+        used = len(title_prefix) + len(view_text)
+        if search_text and used < w - 1:
+            stdscr.addnstr(0, used, search_text, max(0, w-1-used), title_attr)
         list_start = draw_command_panel(stdscr, w, current_row, current_issue)
         panel_x = max(45, w - 34) if w >= 100 else w
         left_w = max(1, panel_x - 1) if w >= 100 else w
@@ -2530,9 +2009,28 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg=""):
             else:
                 old_pos = pos
                 msg = normal_image_actions_menu(stdscr, host, state_path, rows[pos], base_rows)
-                rows = base_rows
+                selected_path_after_action = None
+                if isinstance(msg, str) and msg.startswith("Converted image created: "):
+                    selected_path_after_action = msg.split(": ", 1)[1].strip()
+                try:
+                    base_rows = load_active_curator_rows(state_path)
+                    choice = next((c for c in load_sql_view_choices() if c[0] == sql_view_name), None)
+                    if choice:
+                        rows, sql_filter_keys, sql_filter_rank, sql_view_name = apply_sql_view_choice(state_path, base_rows, choice)
+                    else:
+                        rows = base_rows
+                        sql_filter_keys = sql_filter_rank = None
+                        sql_view_name = "All loaded rows"
+                except Exception as e:
+                    rows = base_rows
+                    sql_filter_keys = sql_filter_rank = None
+                    sql_view_name = "All loaded rows"
+                    msg = f"{msg}; view refresh failed: {e}"
                 if rows:
-                    pos = min(old_pos, len(rows) - 1)
+                    if selected_path_after_action:
+                        pos = next((i for i, r in enumerate(rows) if r.get("path") == selected_path_after_action), min(old_pos, len(rows) - 1))
+                    else:
+                        pos = min(old_pos, len(rows) - 1)
                     top = min(top, max(0, len(rows) - 1))
         elif ch == ord('$'):
             show_disk_directory(stdscr, host, rows[pos], allow_select=False)
@@ -2584,7 +2082,13 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg=""):
                 msg = f"Wishlist {wish!r}; cleared {cleared} local/{remote_cleared} U2 scratch; {search_msg}"
         elif ch == ord('y'):
             if sql_view_name == "A64 inbox":
-                msg = "Already in A64 inbox; q returns to curator"
+                search_msg = a64_search_flow(stdscr, state_path, initial_data=last_a64_search_defaults())
+                inbox = load_a64_inbox_rows(state_path)
+                if inbox:
+                    rows, sql_view_name, sql_filter_keys, sql_filter_rank, top, pos, inbox_msg = enter_a64_inbox(state_path)
+                    msg = f"{search_msg}; {inbox_msg}"
+                else:
+                    msg = search_msg
                 continue
             cached = reconcile_a64_inbox(state_path)
             if cached:

@@ -1,18 +1,5 @@
-summer games
-winter games
-world games
-california games
-montezuma
-paperboy
-karateka
-choplifter
-lode runner
-miner 2049er
 bruce lee
-aztec challenge
 fort apocalypse
-raid over moscow
-beach head
 zaxxon
 pooyan
 dig dug
@@ -44,3 +31,6 @@ green beret
 rtype
 turrican
 turrican ii
+winter games
+world games
+california games

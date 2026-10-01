@@ -37,6 +37,16 @@ Rules:
 - A64 delete removes local candidate, updates A64 DB state, removes row from visible list; if promoted path exists, it attempts to delete U2 copy too.
 - Normal curator delete removes U2 file, marks `Image.storage_status = deleted`, sets `deleted_reason`, removes visible row.
 
+## GitHub issue tracker
+
+Bug reports and future enhancement notes have been moved to GitHub issues.
+
+Current project issues:
+
+```bash
+gh issue list
+```
+
 ## A64 DB/state details
 
 A64 tables/views currently include:

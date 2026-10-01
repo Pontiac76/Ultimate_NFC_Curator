@@ -8,9 +8,20 @@ from u2_curate_tui import A64_INBOX_ORDER_BY
 class A64SortTests(unittest.TestCase):
     def test_converted_image_sorts_next_to_source(self):
         conn = sqlite3.connect(":memory:")
-        conn.execute("CREATE TABLE rows(title TEXT, file_type TEXT, a64_id TEXT, entry_index INTEGER)")
+        conn.execute("""
+            CREATE TABLE rows(
+                title TEXT,
+                result_title TEXT DEFAULT '',
+                a64_name TEXT DEFAULT '',
+                file_type TEXT,
+                a64_id TEXT,
+                a64_category INTEGER DEFAULT 0,
+                entry_index INTEGER,
+                entries_count INTEGER DEFAULT 1
+            )
+        """)
         conn.executemany(
-            "INSERT INTO rows VALUES (?, ?, ?, ?)",
+            "INSERT INTO rows(title, file_type, a64_id, entry_index) VALUES (?, ?, ?, ?)",
             [
                 ("beach_head", "d64", "249351", 0),
                 ("BeachHead3-AF", "d64", "139900", 0),
