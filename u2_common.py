@@ -3,6 +3,7 @@
 
 import csv
 import ftplib
+import io
 import ipaddress
 import json
 import os
@@ -17,7 +18,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 STATE_FILE = Path(".u2_state.json")
@@ -232,7 +233,13 @@ def strip_usb_prefix(path):
 
 
 def candidate_usb_paths(path):
-    """Return concrete /Usb0 or /Usb1 paths. Tags may omit /UsbX."""
+    """Return concrete /Usb0 or /Usb1 paths. Tags may omit /UsbX.
+
+    Non-USB Ultimate roots such as /Flash and /Temp are already concrete and
+    must not be rewritten under /Usb0 or /Usb1.
+    """
+    if path.startswith("/Flash/") or path == "/Flash" or path.startswith("/Temp/") or path == "/Temp":
+        return [path]
     if path.startswith("/Usb0/") or path == "/Usb0":
         tail = strip_usb_prefix(path)
         return ["/Usb0" + ("" if tail == "/" else tail), "/Usb1" + ("" if tail == "/" else tail)]
@@ -267,6 +274,56 @@ def ftp_download(host, ultimate_path):
                 return r.read()
         except Exception as e:
             last_err = e
+    raise last_err
+
+
+def ftp_upload(host, ultimate_path, data):
+    """Upload bytes to Ultimate FTP, trying Usb0/Usb1 fallback for USB paths."""
+    last_err = None
+    for path in candidate_usb_paths(ultimate_path):
+        ftp = ftplib.FTP(host, timeout=30)
+        try:
+            ftp.login("anonymous", "ftp@example.com")
+            parent = str(PurePosixPath(path).parent)
+            parts = [p for p in parent.split("/") if p]
+            cur = ""
+            for part in parts:
+                cur += "/" + part
+                try:
+                    ftp.mkd(cur)
+                except Exception:
+                    pass
+            with io.BytesIO(data) as bio:
+                ftp.storbinary("STOR " + path, bio)
+            ftp.quit()
+            note_usb_success(ultimate_path, path)
+            return path
+        except Exception as e:
+            last_err = e
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+    raise last_err
+
+
+def ftp_delete(host, ultimate_path):
+    """Delete a file from Ultimate FTP, trying Usb0/Usb1 fallback."""
+    last_err = None
+    for path in candidate_usb_paths(ultimate_path):
+        ftp = ftplib.FTP(host, timeout=10)
+        try:
+            ftp.login("anonymous", "ftp@example.com")
+            ftp.delete(path)
+            ftp.quit()
+            note_usb_success(ultimate_path, path)
+            return path
+        except Exception as e:
+            last_err = e
+            try:
+                ftp.quit()
+            except Exception:
+                pass
     raise last_err
 
 
@@ -308,6 +365,50 @@ def ftp_list(host, ultimate_path):
             except Exception:
                 pass
     raise last_err
+
+
+def clean_ftp_dir(host, ultimate_dir):
+    """Delete files directly under an Ultimate FTP directory. Best-effort.
+
+    Uses candidate_usb_paths(), so /_A64_Test works regardless of whether the
+    USB stick is currently Usb0 or Usb1. Does not recurse into subdirectories.
+    Returns count deleted.
+    """
+    last_err = None
+    for concrete_dir in candidate_usb_paths(ultimate_dir):
+        ftp = ftplib.FTP(host, timeout=10)
+        deleted = 0
+        try:
+            ftp.login("anonymous", "ftp@example.com")
+            ftp.cwd(concrete_dir)
+            try:
+                names = [n for n in ftp.nlst() if n not in (".", "..")]
+            except Exception:
+                names = []
+            for name in names:
+                try:
+                    ftp.delete(name)
+                    print(f"STEP clean ftp deleted {concrete_dir.rstrip('/')}/{name}")
+                    deleted += 1
+                except Exception as e:
+                    print(f"STEP clean ftp warning {concrete_dir.rstrip('/')}/{name}: {e}")
+            ftp.quit()
+            note_usb_success(ultimate_dir, concrete_dir)
+            if not names:
+                print(f"STEP clean ftp: {concrete_dir} is empty")
+            return deleted
+        except Exception as e:
+            last_err = e
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+    raise last_err
+
+
+def clean_a64_test_cache(host):
+    """Delete scratch files uploaded for local A64 test launches."""
+    return clean_ftp_dir(host, "/_A64_Test")
 
 
 def clean_temp(host):
@@ -415,7 +516,7 @@ def extract_prg_with_c1541(img, wanted_name, suffix=".d64"):
 
 def title_from_path(path):
     base = os.path.basename(path)
-    for ext in (".d64", ".d71", ".d81", ".g64", ".prg", ".crt", ".tap"):
+    for ext in (".d64", ".d71", ".d81", ".g64", ".prg", ".crt", ".tap", ".sid"):
         if base.lower().endswith(ext):
             base = base[:-len(ext)]
     return base.replace("_", " ").replace("-", " ").strip()
@@ -492,10 +593,15 @@ def reset_machine(host, clear_cart=True):
 
 
 def cold_boot(host):
-    return reset_machine(host)
+    """Closest API equivalent to power-cycle for launch setup.
+
+    Reset can leave the C128/C64 transition wedged after assorted cartridge/SID
+    and disk activity. Reboot has proven more reliable from the TUI `B` path.
+    """
+    return reboot_machine(host)
 
 
-def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
+def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64", status_callback=None):
     """Mount a known blank 1541 image, wait, then reset/cold boot.
 
     This gives the U2 a simple/known disk state before the machine reboots.
@@ -503,13 +609,19 @@ def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64"):
     """
     try:
         print(f"STEP mount blank disk before reset: {blank_path}")
+        if status_callback:
+            status_callback(f"Mounting blank disk {blank_path}")
         status, body = mount_image(host, blank_path, drive)
         print(f"STEP mounted blank: HTTP {status} {body.strip()}")
+        if status_callback:
+            status_callback("Blank disk mounted; settling U2")
         print("STEP wait 2s for U2 settle")
         time.sleep(2.0)
     except Exception as e:
         print(f"STEP blank disk warning: {e}")
-    print("STEP cold boot/reset")
+    print("STEP cold boot/reboot")
+    if status_callback:
+        status_callback("Rebooting machine")
     return cold_boot(host)
 
 
@@ -650,7 +762,12 @@ def detect_machine_mode(host):
 
 def mount_image(host, image_path, drive="a"):
     last_err = None
-    for concrete in candidate_usb_paths(image_path):
+    # If caller supplied a concrete /UsbX path, do not try the other slot after
+    # an API mount failure. For scratch uploads we already verified the exact
+    # path; falling back only obscures the real U2 error (e.g. G64 illegal mount
+    # mode becomes reported against Usb1 even though Usb0 was the uploaded file).
+    paths = [image_path] if image_path.startswith(("/Usb0/", "/Usb1/")) else candidate_usb_paths(image_path)
+    for concrete in paths:
         try:
             status, body = api_put(host, f"/v1/drives/{drive}:mount", {"image": concrete})
             note_usb_success(image_path, concrete)
@@ -673,6 +790,8 @@ def keyboard_buffer_addrs(machine_mode):
 
 def wait_keyboard_buffer_empty(host, machine_mode, timeout=2.0, interval=0.02):
     mode, _buf_addr, count_addr = keyboard_buffer_addrs(machine_mode)
+    if timeout is not None and timeout <= 0:
+        return True
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -687,7 +806,7 @@ def wait_keyboard_buffer_empty(host, machine_mode, timeout=2.0, interval=0.02):
     return False
 
 
-def inject_key_chunk(host, text, machine_mode="c128", invert_case=True):
+def inject_key_chunk(host, text, machine_mode="c128", invert_case=True, drain_timeout=2.0):
     """Inject one already-sized chunk through the keyboard buffer."""
     wire_text = inverse_ascii_case(text) if invert_case else text
     mode, buf_addr, count_addr = keyboard_buffer_addrs(machine_mode)
@@ -697,11 +816,11 @@ def inject_key_chunk(host, text, machine_mode="c128", invert_case=True):
     # POST /v1/machine:writemem can return 404 depending on firmware/state.
     api_put(host, "/v1/machine:writemem", {"address": buf_addr, "data": data.hex()})
     result = api_put(host, "/v1/machine:writemem", {"address": count_addr, "data": f"{len(data):02x}"})
-    wait_keyboard_buffer_empty(host, machine_mode)
+    wait_keyboard_buffer_empty(host, machine_mode, timeout=drain_timeout)
     return result
 
 
-def inject_keys(host, text, machine_mode="c128", invert_case=True, chunk_size=10, chunk_delay=0.05):
+def inject_keys(host, text, machine_mode="c128", invert_case=True, chunk_size=10, chunk_delay=0.05, drain_timeout=2.0):
     """Inject arbitrary text through the keyboard buffer, safely chunked.
 
     C128 native mode uses buffer $034A/count $00D0.
@@ -710,7 +829,7 @@ def inject_keys(host, text, machine_mode="c128", invert_case=True, chunk_size=10
     last = None
     for i in range(0, len(text), chunk_size):
         chunk = text[i:i + chunk_size]
-        last = inject_key_chunk(host, chunk, machine_mode=machine_mode, invert_case=invert_case)
+        last = inject_key_chunk(host, chunk, machine_mode=machine_mode, invert_case=invert_case, drain_timeout=drain_timeout)
         if i + chunk_size < len(text) and chunk_delay:
             print(f"TYPE chunk delay {chunk_delay}s")
             time.sleep(chunk_delay)
@@ -1302,7 +1421,7 @@ def run_launch_script(host, image_path, machine_mode, script_dir="scripts"):
     return ran
 
 
-def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False):
+def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False, status_callback=None):
     """Cold boot, detect mode, optionally GO64, then mount/load/run a disk image.
 
     entry controls the LOAD target for disk mode. Blank means LOAD"*".
@@ -1318,8 +1437,10 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         unmount_image(host, drive)
     except Exception as e:
         print(f"STEP unmount warning: {e}")
-    settle_with_blank_disk_then_boot(host, drive)
+    settle_with_blank_disk_then_boot(host, drive, status_callback=status_callback)
     print("STEP wait for BASIC READY after reset")
+    if status_callback:
+        status_callback("Waiting for BASIC READY")
     if not wait_for_screen_text(host, "READY", timeout=12.0):
         print("STEP READY not detected; falling back to 3s reset delay")
         time.sleep(3.0)
@@ -1337,12 +1458,16 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         if not wait_for_screen_text(host, "READY", timeout=8.0):
             print("STEP READY not detected before GO64; proceeding anyway")
         print("STEP request C64 mode: go64")
+        if status_callback:
+            status_callback("Sending GO64")
         inject_keys(host, "go64\r", machine_mode="c128")
         print("STEP wait for GO64 confirmation prompt")
         if not wait_for_screen_text(host, "ARE YOU SURE", timeout=8.0):
             print("STEP prompt not detected; falling back to short delay before Y")
             time.sleep(1.0)
         print("STEP confirm C64 mode: y")
+        if status_callback:
+            status_callback("Confirming GO64")
         inject_keys(host, "y\r", machine_mode="c128")
         print("STEP wait for C64 BASIC after GO64")
         if wait_for_screen_text(host, "COMMODORE 64 BASIC", timeout=8.0):
@@ -1356,11 +1481,15 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         active_mode = detected["mode"] if detected["mode"] in ("c64", "c128") else target_mode
 
     print("STEP mount image")
+    if status_callback:
+        status_callback(f"Mounting image {image_path}")
     status, body = mount_image(host, image_path, drive)
     print(f"STEP mounted image for {target_mode}: HTTP {status} {body.strip()}")
 
     load_target = entry or "*"
     print(f'STEP send LOAD command: lO"{load_target}",8,1')
+    if status_callback:
+        status_callback(f"Loading {load_target}")
     # C64/C128 keyboard buffers are small. LOAD"*",8,1 is exactly short
     # enough, but named loaders can exceed the safe buffer length and overwrite
     # adjacent editor state, causing odd colors/control behavior. Type long
@@ -1387,13 +1516,71 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
         print("STEP wait 2s for load")
         time.sleep(2.0)
         print("STEP send RUN")
+        if status_callback:
+            status_callback("Sending RUN")
         inject_keys(host, "run\r", machine_mode=active_mode)
         run_launch_script(host, image_path, active_mode)
     print("STEP launch sequence complete")
     return status, body
 
 
-def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False):
+def create_blank_d81_image(title="prgdata", disk_id="64"):
+    if not c1541_available():
+        raise RuntimeError("c1541 is not installed; cannot create PRG sidecar D81")
+    fd, tmp = tempfile.mkstemp(suffix=".d81")
+    os.close(fd)
+    os.remove(tmp)
+    safe_title = re.sub(r'[^A-Za-z0-9 _-]+', ' ', str(title))[:16].strip() or "prgdata"
+    safe_id = re.sub(r'[^A-Za-z0-9]+', '', str(disk_id))[:5] or "64"
+    try:
+        r = subprocess.run(["c1541", "-format", f"{safe_title},{safe_id}", "d81", tmp], text=True, capture_output=True, timeout=60)
+        if r.returncode != 0 or not Path(tmp).exists():
+            raise RuntimeError((r.stderr or r.stdout or "c1541 D81 format failed").strip())
+        return Path(tmp).read_bytes()
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_launch_sidecar_d81(host, payload_path, label="data"):
+    """Ensure a blank D81 exists beside a launchable file for save/load data.
+
+    Naming convention is <file>.<ext>.d81, e.g. game.prg.d81 or cart.crt.d81.
+    Inventory scanning skips these. Returns the Ultimate path to the sidecar D81.
+    """
+    p = PurePosixPath(strip_usb_prefix(payload_path))
+    sidecar = str(p.with_name(p.name + ".d81"))
+    try:
+        ftp_size(host, sidecar)
+        return sidecar
+    except Exception:
+        pass
+    title = p.stem[:16] or label
+    data = create_blank_d81_image(title=title, disk_id="64")
+    ftp_upload(host, sidecar, data)
+    return sidecar
+
+
+def ensure_prg_sidecar_d81(host, prg_path):
+    return ensure_launch_sidecar_d81(host, prg_path, label="prgdata")
+
+
+def ensure_crt_sidecar_d81(host, crt_path):
+    return ensure_launch_sidecar_d81(host, crt_path, label="crtdata")
+
+
+def emit_launch_status(status_callback, text, kind="normal"):
+    if not status_callback:
+        return
+    try:
+        status_callback(text, kind)
+    except TypeError:
+        status_callback(text)
+
+
+def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False, status_callback=None):
     if not payload.startswith("U2+:"):
         raise RuntimeError("Payload does not start with U2+:")
     mode, rest = payload[4:].split(":", 1)
@@ -1406,6 +1593,16 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
             print(f"Extracted {name!r}, {len(blob)} bytes")
         if not blob:
             raise RuntimeError(f"Downloaded PRG payload is 0 bytes: {path}")
+        if lower.endswith(".prg"):
+            try:
+                emit_launch_status(status_callback, "Preparing PRG save sidecar D81", "work")
+                sidecar = ensure_prg_sidecar_d81(host, path)
+                emit_launch_status(status_callback, f"Mounting PRG save sidecar {sidecar}", "work")
+                mount_image(host, sidecar, "a")
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"WARN: could not create/mount PRG sidecar D81 for saves: {e}")
+        emit_launch_status(status_callback, "Launching PRG", "normal")
         result = post_runner(host, "/v1/runners:run_prg", blob)
         run_launch_script(host, path, target_mode)
         return result
@@ -1413,11 +1610,25 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
         blob = ftp_download(host, path)
         if not blob:
             raise RuntimeError(f"Downloaded CRT payload is 0 bytes: {path}")
+        try:
+            emit_launch_status(status_callback, "Preparing CRT save sidecar D81", "work")
+            sidecar = ensure_crt_sidecar_d81(host, path)
+            emit_launch_status(status_callback, f"Mounting CRT save sidecar {sidecar}", "work")
+            mount_image(host, sidecar, "a")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"WARN: could not create/mount CRT sidecar D81 for saves: {e}")
+        emit_launch_status(status_callback, "Launching CRT", "normal")
         return post_runner(host, "/v1/runners:run_crt", blob)
+    if mode == "sid":
+        blob = ftp_download(host, path)
+        if not blob:
+            raise RuntimeError(f"Downloaded SID payload is 0 bytes: {path}")
+        return post_runner(host, "/v1/runners:sidplay", blob)
     if mode in ("d64", "disk"):
         image_exts = (".d64", ".d71", ".d81")
         if lower.endswith(image_exts):
-            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp)
+            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp, status_callback=status_callback)
         if lower.endswith((".g64", ".tap")):
             raise RuntimeError("G64/TAP launch is intentionally unsupported for now")
     raise RuntimeError(f"Unsupported launch mode {mode!r} for path {path!r}")
@@ -1454,7 +1665,7 @@ def ensure_file_type(conn):
     existing = {r[1] for r in conn.execute("PRAGMA table_info(FileType)")}
     if "enabled" not in existing:
         conn.execute("ALTER TABLE FileType ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1")
-    for name, enabled in (("d64", 1), ("d71", 1), ("d81", 1), ("prg", 1), ("crt", 1), ("g64", 0), ("tap", 0)):
+    for name, enabled in (("d64", 1), ("d71", 1), ("d81", 1), ("prg", 1), ("crt", 1), ("sid", 1), ("g64", 0), ("tap", 0)):
         conn.execute("INSERT OR IGNORE INTO FileType (name, enabled) VALUES (?, ?)", (name, enabled))
         if enabled == 0:
             conn.execute("UPDATE FileType SET enabled = 0 WHERE name = ?", (name,))
@@ -1473,7 +1684,7 @@ def ensure_rows_table(conn, fields=None):
     ensure_lookup(conn, "StorageStatus", ["present", "missing", "deleted", "returned"])
     ensure_lookup(conn, "MachineMode", ["c64", "c128"])
     ensure_file_type(conn)
-    ensure_lookup(conn, "LaunchMode", ["disk", "prg", "crt", "tap"])
+    ensure_lookup(conn, "LaunchMode", ["disk", "prg", "crt", "sid", "tap"])
     conn.execute("CREATE TABLE IF NOT EXISTS Tag (pk_ID INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE)")
     conn.execute("CREATE TABLE IF NOT EXISTS ScanPath (path TEXT PRIMARY KEY)")
     conn.execute(
@@ -1603,8 +1814,9 @@ def read_sqlite_rows(path):
 def write_sqlite_rows(path, rows, fields):
     with sqlite_connect(path) as conn:
         ensure_rows_table(conn, fields)
-        conn.execute("DELETE FROM Image")
         for r in rows:
+            if not r.get("path"):
+                continue
             file_type = r.get("file_type") or r.get("type")
             vals = {
                 "title": r.get("title", ""),
@@ -1624,7 +1836,11 @@ def write_sqlite_rows(path, rows, fields):
             }
             columns = ", ".join(vals)
             placeholders = ", ".join("?" for _ in vals)
-            conn.execute(f"INSERT INTO Image ({columns}) VALUES ({placeholders})", list(vals.values()))
+            updates = ", ".join(f"{k}=excluded.{k}" for k in vals if k != "path")
+            conn.execute(
+                f"INSERT INTO Image ({columns}) VALUES ({placeholders}) ON CONFLICT(path) DO UPDATE SET {updates}",
+                list(vals.values()),
+            )
 
 
 def import_scan_paths(db_path, paths):

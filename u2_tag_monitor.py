@@ -144,6 +144,9 @@ def launch_path(host, db, path):
     if lower.endswith(".crt"):
         blob = ftp_download(host, path)
         return post_runner(host, "/v1/runners:run_crt", blob)
+    if lower.endswith(".sid"):
+        blob = ftp_download(host, path)
+        return post_runner(host, "/v1/runners:sidplay", blob)
     if lower.endswith(".prg"):
         blob = ftp_download(host, path)
         result = post_runner(host, "/v1/runners:run_prg", blob)

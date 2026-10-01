@@ -288,6 +288,13 @@ def launch(host, text, allow_d64_prg_loader=False):
         print(f"Ultimate response: HTTP {status} {body.strip()}")
         return
 
+    if mode == "sid":
+        blob = download_from_ultimate(host, path)
+        print(f"Downloaded SID: {len(blob)} bytes")
+        status, body = post_to_runner(host, "/v1/runners:sidplay", blob)
+        print(f"Ultimate response: HTTP {status} {body.strip()}")
+        return
+
     if mode in ("d64", "disk"):
         if not allow_d64_prg_loader:
             raise RuntimeError(
