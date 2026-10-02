@@ -88,6 +88,8 @@ This project is for people who love old Commodore hardware, enjoy modern-retro h
 
 If you like the idea of tapping a card and watching a real or Ultimate-powered Commodore setup come alive, this is the kind of strange little contraption you may appreciate.
 
+This project is also for the original author to take this mix of old and new hardware to retro computer shows and allow anyone of any age (And any memory longevity capacity) to pick a card and play an old favorite.
+
 ## In short
 
 Ultimate NFC Curator is a way to take classic Commodore software, organize it thoughtfully, and launch it from physical NFC cards.

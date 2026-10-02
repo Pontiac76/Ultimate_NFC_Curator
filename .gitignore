@@ -56,5 +56,5 @@ screen_dump_*.txt
 modplayer_screen_ansi*.txt
 curator
 
-# Local scratch/test workspace
-test/
+# Local merge/conversion logs
+merge_logs/
