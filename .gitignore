@@ -12,6 +12,9 @@ u2_hosts.txt
 
 # Runtime/local state
 .u2_state.json
+.u2_curate_tui_state.json
+a64_inbox/
+a64_cache/
 curator.db
 curator.db.*
 curator.db-shm

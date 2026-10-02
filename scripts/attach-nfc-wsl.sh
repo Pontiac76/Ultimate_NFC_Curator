@@ -48,6 +48,14 @@ if printf '%s\n' "$LIST" | awk -v busid="$BUSID" '$1 == busid {print}' | grep -E
   exit 2
 fi
 
+STATE_LINE="$(printf '%s\n' "$LIST" | awk -v busid="$BUSID" '$1 == busid {print}')"
+if printf '%s\n' "$STATE_LINE" | grep -Eiq 'Attached'; then
+  echo "Device is already attached; forcing detach/reattach to clear stale CH340/WSL I/O state..."
+  DETACH_OUT="$(run_usbipd detach --busid "$BUSID" 2>&1 || true)"
+  printf '%s\n' "$DETACH_OUT"
+  sleep 2
+fi
+
 echo "Attaching to WSL..."
 if ! ATTACH_OUT="$(run_usbipd attach --wsl --busid "$BUSID" 2>&1)"; then
   if printf '%s\n' "$ATTACH_OUT" | grep -Eiq 'already attached'; then

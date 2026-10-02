@@ -6,7 +6,7 @@ import os
 from pathlib import Path, PurePosixPath
 from u2_common import *
 
-DEFAULT_EXTS = (".d64", ".d71", ".d81", ".prg", ".crt", ".g64", ".tap")
+DEFAULT_EXTS = (".d64", ".d71", ".d81", ".prg", ".crt", ".sid", ".g64", ".tap")
 
 
 def nonnegative_int(value):
@@ -17,6 +17,13 @@ def nonnegative_int(value):
     if parsed < 0:
         raise argparse.ArgumentTypeError("value must be >= 0")
     return parsed
+
+
+EXCLUDED_SCAN_PREFIXES = ("/_A64_Test/", "/Temp/")
+
+
+def inventory_skip_path(path):
+    return any(path.startswith(prefix) for prefix in EXCLUDED_SCAN_PREFIXES)
 
 
 def walk_ftp(host, root, max_depth, exts=DEFAULT_EXTS, progress_depth=3):
@@ -36,7 +43,12 @@ def walk_ftp(host, root, max_depth, exts=DEFAULT_EXTS, progress_depth=3):
                 if depth < max_depth:
                     todo.append((child, depth + 1))
             else:
-                if r["name"].lower().endswith(exts):
+                if inventory_skip_path(child):
+                    continue
+                lower_name = r["name"].lower()
+                if lower_name.endswith((".prg.d81", ".crt.d81")):
+                    continue
+                if lower_name.endswith(exts):
                     yield child, r
 
 
@@ -48,12 +60,14 @@ def suggest_for_file(host, path, inspect_disks=False):
     detail = ""
     if lower.endswith(".crt"):
         return {"title": title, "path": path, "file_type": "crt", "mode": "crt", "entry": "", "payload": payload_for("crt", path), "detail": "CRT"}
+    if lower.endswith(".sid"):
+        return {"title": title, "path": path, "file_type": "sid", "mode": "sid", "entry": "", "payload": payload_for("sid", path), "detail": "SID"}
     if lower.endswith(".prg"):
         return {"title": title, "path": path, "file_type": "prg", "mode": "prg", "entry": "", "payload": payload_for("prg", path), "detail": "PRG"}
-    if lower.endswith((".g64", ".tap")):
-        file_type = lower.rsplit(".", 1)[1]
-        mode = "tap" if file_type == "tap" else "disk"
-        return {"title": title, "path": path, "file_type": file_type, "mode": mode, "entry": "", "payload": payload_for(mode, path), "detail": f"{file_type.upper()} image (unsupported/disabled by default)"}
+    if lower.endswith(".g64"):
+        return {"title": title, "path": path, "file_type": "g64", "mode": "disk", "entry": "", "payload": payload_for("disk", path), "detail": "G64 image (unsupported/disabled by default)"}
+    if lower.endswith(".tap"):
+        return {"title": title, "path": path, "file_type": "tap", "mode": "tap", "entry": "", "payload": payload_for("tap", path), "detail": "TAP image (unsupported/disabled by default)"}
     if lower.endswith((".d64", ".d71", ".d81")):
         file_type = lower.rsplit(".", 1)[1]
         mode = "disk"
