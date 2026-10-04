@@ -13,6 +13,7 @@ import contextlib
 import io
 import os
 import select
+import subprocess
 import sys
 import termios
 import time
@@ -180,18 +181,66 @@ def stdin_key_available():
     return None
 
 
-def open_reader_when_available(device, baud, retry=1.0):
+def default_nfc_attach_command():
+    script = Path(__file__).with_name("scripts") / "attach-nfc-wsl.sh"
+    if script.exists():
+        return ["bash", str(script)]
+    return None
+
+
+def try_attach_nfc_reader(command=None):
+    if command == []:
+        return False
+    cmd = command or default_nfc_attach_command()
+    if not cmd:
+        return False
+    try:
+        print(f"NFC reader missing; attempting attach: {' '.join(cmd)}")
+        subprocess.run(cmd, check=False, timeout=90)
+        return True
+    except Exception as e:
+        print(f"NFC reader attach attempt failed: {e}")
+        return False
+
+
+def nfc_device_candidates(device):
+    if device and device != "auto":
+        return [device]
+    return [
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "/dev/ttyUSB0",
+    ]
+
+
+def visible_nfc_device(device):
+    for candidate in nfc_device_candidates(device):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def open_reader_when_available(device, baud, retry=1.0, attach_command=None, attach_retry=10.0):
     baud_const = getattr(termios, f"B{baud}")
+    requested_device = device
+    last_attach = 0.0
     while True:
-        if not os.path.exists(device):
-            print(f"Waiting for NFC reader device {device}...")
+        active_device = visible_nfc_device(requested_device)
+        if not active_device:
+            now = time.time()
+            if now - last_attach >= attach_retry:
+                try_attach_nfc_reader(attach_command)
+                last_attach = now
+                active_device = visible_nfc_device(requested_device)
+                if active_device:
+                    continue
+            print(f"Waiting for NFC reader device ({', '.join(nfc_device_candidates(requested_device))})...")
             time.sleep(retry)
             continue
         try:
-            fd = open_serial(device, baud_const)
+            fd = open_serial(active_device, baud_const)
             fw = require_response(fd, [0x02], 0x03, timeout=1.0)
             require_response(fd, [0x14, 0x01, 0x14, 0x01], 0x15, timeout=1.0)
-            print(f"PN532 ready on {device}: {fw.hex(' ')}")
+            print(f"PN532 ready on {active_device}: {fw.hex(' ')}")
             return fd
         except KeyboardInterrupt:
             raise
@@ -221,8 +270,9 @@ def wait_for_tag_removal(fd, poll_delay=0.25):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", "-d", default="/dev/ttyUSB0")
+    ap.add_argument("--device", "-d", default="auto", help="serial device, or 'auto' to prefer /dev/serial/by-id and fall back to /dev/ttyUSB0")
     ap.add_argument("--baud", type=int, default=115200, choices=[9600, 19200, 38400, 57600, 115200])
+    ap.add_argument("--no-auto-attach", action="store_true", help="do not run scripts/attach-nfc-wsl.sh when the reader device is missing")
     ap.add_argument("--ultimate", default="auto")
     ap.add_argument("--state", action="append", default=["curator.db"], help="SQLite launch DB or legacy TSV/CSV manifest; may be repeated")
     ap.add_argument("--once", action="store_true")
@@ -250,7 +300,7 @@ def main():
     last_text = None
     last_seen = 0.0
     try:
-        fd = open_reader_when_available(args.device, args.baud)
+        fd = open_reader_when_available(args.device, args.baud, attach_command=None if not args.no_auto_attach else [])
         state(ANSI_GREEN, "READY", "Waiting for NFC tag...", color_enabled)
         while True:
             ch = stdin_key_available()

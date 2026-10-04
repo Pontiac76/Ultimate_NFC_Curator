@@ -351,7 +351,7 @@ def run_console_command(host, command, mode):
         status, body = reset_machine(host)
         print(f"reset HTTP {status}: {body.strip()}")
     elif cmd == "reboot":
-        status, body = reboot_machine(host)
+        status, body = settle_with_blank_disk_then_boot(host)
         print(f"reboot HTTP {status}: {body.strip()}")
     elif cmd in ("unmount", "remove", "eject"):
         drive = drive_arg(parts[1] if len(parts) > 1 else "a")
@@ -417,7 +417,7 @@ def ensure_nfc_reader_connected(verbose=False, force_attach=False):
     if not script.exists():
         return False, "NFC reader not visible and attach script not found"
     try:
-        p = subprocess.run([str(script)], text=True, capture_output=True, timeout=30)
+        p = subprocess.run(["bash", str(script)], text=True, capture_output=True, timeout=30)
     except Exception as e:
         return False, f"NFC attach script failed: {e}"
     dev = nfc_reader_device()
@@ -1455,13 +1455,8 @@ def launch_local_a64_candidate(stdscr, host, row, target_mode="c64", skip_prehel
         if not data:
             raise RuntimeError(f"Local PRG is 0 bytes: {local}")
         remote_prg = upload_a64_scratch_verified(stdscr, host, row, local, data, status_callback=status_callback)
-        if status_callback:
-            status_callback("Preparing PRG save sidecar D81", "work")
-        sidecar = ensure_prg_sidecar_d81(host, remote_prg)
-        if status_callback:
-            status_callback(f"Mounting PRG save sidecar {sidecar}", "work")
-        mount_image(host, sidecar, "a")
-        time.sleep(0.5)
+        # Default sidecar policy is none; remote_prg is uploaded only to verify
+        # the local candidate can be promoted/tested from the Ultimate later.
         if status_callback:
             status_callback("Launching PRG", "normal")
         result = post_runner(host, "/v1/runners:run_prg", data)
@@ -1471,13 +1466,8 @@ def launch_local_a64_candidate(stdscr, host, row, target_mode="c64", skip_prehel
         if not data:
             raise RuntimeError(f"Local CRT is 0 bytes: {local}")
         remote_crt = upload_a64_scratch_verified(stdscr, host, row, local, data, status_callback=status_callback)
-        if status_callback:
-            status_callback("Preparing CRT save sidecar D81", "work")
-        sidecar = ensure_crt_sidecar_d81(host, remote_crt)
-        if status_callback:
-            status_callback(f"Mounting CRT save sidecar {sidecar}", "work")
-        mount_image(host, sidecar, "a")
-        time.sleep(0.5)
+        # Default sidecar policy is none; remote_crt is uploaded only to verify
+        # the local candidate can be promoted/tested from the Ultimate later.
         if status_callback:
             status_callback("Launching CRT", "normal")
         return post_runner(host, "/v1/runners:run_crt", data)
@@ -2342,10 +2332,9 @@ def sql_view_result(db_path, sql):
     return seen, {key: i for i, key in enumerate(ordered)}, sql_rows
 
 
-def run(stdscr, rows, host, db_path, log_path, startup_msg=""):
+def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
     state_path = db_path  # A64 tables and curator rows live in the same SQLite DB.
     base_rows = rows
-def run(stdscr, rows, host, out, log_path, state_path, cache=None):
     curses.curs_set(0)
     if curses.has_colors():
         curses.start_color()
@@ -2464,12 +2453,10 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                 section = "Packages" if cnt >= 2 else "Single File Images"
                 pkg = (r.get("a64_id"), r.get("a64_category")) if cnt >= 2 else None
                 if section != last_section:
-                    if y >= list_start + list_h:
-                        break
                     if section == "Packages" and y > list_start:
                         y += 1
-                        if y >= list_start + list_h:
-                            break
+                    if y >= list_start + list_h:
+                        break
                     stdscr.addnstr(y, 0, section, left_w-1, curses.A_BOLD | curses.A_DIM)
                     y += 1
                     last_section = section
@@ -2479,11 +2466,6 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                     blank_before = 1 if last_pkg is not None else 0
                     needed = blank_before + 1 + remaining_pkg_rows
                     available = (list_start + list_h) - y
-                    # Package rendering is intentionally all-or-stop for packages
-                    # after the first package in the visible window: don't hide a
-                    # large package and then show smaller later packages out of
-                    # context/order. If the first package itself is too large,
-                    # show its header and as many entries as fit.
                     if last_pkg is not None and needed > available:
                         break
                     if blank_before:
@@ -2492,58 +2474,55 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                         break
                     partial = remaining_pkg_rows < cnt or needed > available
                     count_note = f"{cnt} files" if not partial else f"{cnt} files, partial view"
-                    package_title = r.get('result_title') or r.get('a64_name') or r.get('title', '')
+                    package_title = r.get("result_title") or r.get("a64_name") or r.get("title", "")
                     stdscr.addnstr(y, 0, f"  {package_title}  [package: {count_note}]", left_w-1, curses.A_BOLD)
                     y += 1
                     last_pkg = pkg
                 if y >= list_start + list_h:
                     break
-                mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
-                target = "128" if r.get("machine_mode", "c64") in ("c128", "128") else "64"
+                is_128 = r.get("machine_mode", "c64") in ("c128", "128")
+                target = "128" if is_128 else "C64"
                 kind = (r.get("type") or r.get("file_type") or r.get("mode") or "").upper()
-                prefix = "    " if cnt >= 2 else ""
-                line = f"{prefix}{idx+1:3d} [{mark}] [{target}] {r.get('title','')}  ({kind})"
+                mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
+                prefix = ("    " if cnt >= 2 else "") + f"{idx+1:3d} [{mark}] ["
+                suffix = f"] {r.get('title','')}  ({kind})"
                 attr = curses.A_REVERSE if idx == pos else 0
                 if kind.lower() not in LAUNCHABLE_TYPES:
                     attr |= curses.A_DIM
-                stdscr.addnstr(y, 0, line, left_w-1, attr)
+                x = 0
+                stdscr.addnstr(y, x, prefix, max(0, left_w-1-x), attr); x += len(prefix)
+                target_attr = attr | (curses.color_pair(6 if is_128 else 5) if curses.has_colors() else 0)
+                stdscr.addnstr(y, x, target, max(0, left_w-1-x), target_attr); x += len(target)
+                stdscr.addnstr(y, x, suffix, max(0, left_w-1-x), attr)
                 y += 1
         else:
             for y, idx in enumerate(visible[top:top + list_h], start=list_start):
                 r = rows[idx]
-                mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
-                target = "128" if r.get("machine_mode", "c64") in ("c128", "128") else "64"
+                is_128 = r.get("machine_mode", "c64") in ("c128", "128")
+                target = "128" if is_128 else "C64"
                 kind = (r.get("type") or r.get("file_type") or r.get("mode") or "").upper()
-                line = f"{idx+1:3d} [{mark}] [{target}] {r.get('title','')}  ({kind})"
+                if merge_bucket:
+                    # Bucket selection mode changes focus: reuse the status column for
+                    # bucket membership and hide approve/fail state for visual clarity.
+                    mark = "+" if bucket_contains(merge_bucket, r) else " "
+                else:
+                    mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
+                prefix = f"{idx+1:3d} [{mark}] ["
+                target_text = target
+                suffix = f"] {r.get('title','')}  ({kind})"
                 attr = curses.A_REVERSE if idx == pos else 0
-                stdscr.addnstr(y, 0, line, left_w-1, attr)
-        for y, idx in enumerate(visible[top:top + list_h], start=list_start):
-            r = rows[idx]
-            is_128 = r.get("machine_mode", "c64") in ("c128", "128")
-            target = "128" if is_128 else "C64"
-            kind = (r.get("type") or r.get("file_type") or r.get("mode") or "").upper()
-            if merge_bucket:
-                # Bucket selection mode changes focus: reuse the status column for
-                # bucket membership and hide approve/fail state for visual clarity.
-                mark = "+" if bucket_contains(merge_bucket, r) else " "
-            else:
-                mark = "✓" if r.get("status") == "approved" else ("✗" if r.get("status") == "failed" else " ")
-            prefix = f"{idx+1:3d} [{mark}] ["
-            target_text = target
-            suffix = f"] {r.get('title','')}  ({kind})"
-            attr = curses.A_REVERSE if idx == pos else 0
-            if merge_bucket:
-                if row_parent_dir(r) != merge_bucket.get("path"):
-                    attr |= curses.A_DIM
-                elif curses.has_colors():
-                    attr |= curses.color_pair(3)
-            x = 0
-            stdscr.addnstr(y, x, prefix, max(0, left_w-1-x), attr); x += len(prefix)
-            target_attr = attr
-            if curses.has_colors():
-                target_attr = attr | curses.color_pair(6 if is_128 else 5)
-            stdscr.addnstr(y, x, target_text, max(0, left_w-1-x), target_attr); x += len(target_text)
-            stdscr.addnstr(y, x, suffix, max(0, left_w-1-x), attr)
+                if merge_bucket:
+                    if row_parent_dir(r) != merge_bucket.get("path"):
+                        attr |= curses.A_DIM
+                    elif curses.has_colors():
+                        attr |= curses.color_pair(3)
+                x = 0
+                stdscr.addnstr(y, x, prefix, max(0, left_w-1-x), attr); x += len(prefix)
+                target_attr = attr
+                if curses.has_colors():
+                    target_attr = attr | curses.color_pair(6 if is_128 else 5)
+                stdscr.addnstr(y, x, target_text, max(0, left_w-1-x), target_attr); x += len(target_text)
+                stdscr.addnstr(y, x, suffix, max(0, left_w-1-x), attr)
         status_w = w if (w < 100 or status_y >= cmd_rows) else left_w
         detail_w = w if (w < 100 or detail_y >= cmd_rows) else left_w
         footer_w = w if (w < 100 or h - 1 >= cmd_rows) else left_w
@@ -2908,11 +2887,22 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                 log.write(f"[tui] {msg}\n")
             status_rows, status_err = refresh_status_rows(host)
         elif ch == ord('B'):
+            captured_out = io.StringIO()
+            captured_err = io.StringIO()
             try:
-                status, body = reboot_machine(host)
-                msg = f"Cleared cartridge; reboot requested HTTP {status}: {body.strip()}"
+                with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
+                    status, body = settle_with_blank_disk_then_boot(host)
+                msg = f"Mounted blank disk; cleared cartridge; reboot requested HTTP {status}: {body.strip()}"
             except Exception as e:
                 msg = f"Reboot failed: {e}"
+                captured_err.write(str(e) + "\n")
+            with open(log_path, "a") as log:
+                log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} manual reboot ---\n")
+                if captured_out.getvalue():
+                    log.write("[stdout]\n" + captured_out.getvalue())
+                if captured_err.getvalue():
+                    log.write("[stderr]\n" + captured_err.getvalue())
+                log.write(f"[tui] {msg}\n")
             status_rows, status_err = refresh_status_rows(host)
         elif ch == ord('M'):
             try:
@@ -3005,7 +2995,7 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
             captured_out = io.StringIO()
             captured_err = io.StringIO()
             try:
-                def launch_status_callback(event, mounted_path):
+                def launch_status_callback(event, mounted_path=None):
                     nonlocal status_rows, status_err, msg
                     if event == "mounting":
                         title = title_from_path(mounted_path or "")
@@ -3030,7 +3020,10 @@ def run(stdscr, rows, host, out, log_path, state_path, cache=None):
                 with contextlib.redirect_stdout(captured_out), contextlib.redirect_stderr(captured_err):
                     target_mode = rows[pos].get("machine_mode", "c64") or "c64"
                     skip_prehelp = ch == ord('T')
-                    status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status_callback)
+                    if is_local_a64_row(rows[pos]):
+                        status, body = launch_local_a64_candidate(stdscr, host, rows[pos], target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status)
+                    else:
+                        status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status_callback)
                 # Do NOT mark approved/selected here. User must press Space/a after visual confirmation.
                 msg = f"Test launched HTTP {status}: {body.strip()} -- if good, press Space/a to approve"
                 if ch == ord('T'):
@@ -3153,7 +3146,7 @@ def main():
     rows.sort(key=row_sort_key)
     cache = SessionFileCache(enabled=not args.no_cache, cache_dir=args.cache_dir)
     try:
-        result = curses.wrapper(run, rows, host, args.out, args.log, args.state, cache)
+        result = curses.wrapper(run, rows, host, args.inventory, args.log, startup_nfc_msg, cache)
     finally:
         cache.cleanup()
     print(result)

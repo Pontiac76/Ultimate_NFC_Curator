@@ -279,21 +279,36 @@ def ftp_download(host, ultimate_path):
     raise last_err
 
 
+def ftp_ensure_parent_dirs(ftp, ultimate_path):
+    parent = PurePosixPath(ultimate_path).parent
+    parts = [p for p in parent.parts if p != "/"]
+    ftp.cwd("/")
+    for part in parts:
+        try:
+            ftp.cwd(part)
+        except Exception:
+            try:
+                ftp.mkd(part)
+            except Exception:
+                # Directory may have appeared or MKD may report oddly; cwd is the
+                # real test. If this fails too, let the original exception surface.
+                pass
+            ftp.cwd(part)
+
+
 def ftp_upload(host, ultimate_path, data):
-    """Upload bytes to Ultimate FTP, trying Usb0/Usb1 fallback. Refuses overwrite by caller convention."""
+    """Upload bytes to Ultimate FTP, trying Usb0/Usb1 fallback. Creates parent directories."""
     last_err = None
-    parent = str(PurePosixPath(ultimate_path).parent)
-    name = PurePosixPath(ultimate_path).name
     for path in candidate_usb_paths(ultimate_path):
         ftp = ftplib.FTP(host, timeout=30)
         try:
             ftp.login("anonymous", "ftp@example.com")
-            ftp.cwd(str(PurePosixPath(path).parent))
+            ftp_ensure_parent_dirs(ftp, path)
             bio = io.BytesIO(data)
             ftp.storbinary("STOR " + PurePosixPath(path).name, bio)
             ftp.quit()
             note_usb_success(ultimate_path, path)
-            return True
+            return path
         except Exception as e:
             last_err = e
             try:
@@ -824,13 +839,36 @@ def clear_cartridge(host):
     return api_put(host, "/v1/configs/C64%20and%20Cartridge%20Settings/Cartridge", {"value": ""})
 
 
+def blank_basic_screen_memory(host):
+    """Blank common BASIC text screen buffers before reset/reboot.
+
+    READY polling after reset/load can otherwise match stale screen RAM from the
+    previous session before the machine has actually reached BASIC again.
+    Defaults cover the usual C64/C128 40-column screen at $0400 plus a backup
+    buffer; override with U2_PREBOOT_CLEAR_SCREENS=0400,0c00 if needed.
+    """
+    bases = os.environ.get("U2_PREBOOT_CLEAR_SCREENS", "0400,0c00")
+    spaces = bytes([0x20]) * 1000
+    for item in bases.split(","):
+        item = item.strip().lower().removeprefix("$").removeprefix("0x")
+        if not item:
+            continue
+        try:
+            write_mem(host, int(item, 16), spaces)
+            print(f"STEP blanked preboot screen memory ${int(item, 16):04x}")
+        except Exception as e:
+            print(f"STEP preboot screen blank warning at ${item}: {e}")
+
+
 def reboot_machine(host, clear_cart=True):
+    blank_basic_screen_memory(host)
     if clear_cart:
         clear_cartridge(host)
     return api_put(host, "/v1/machine:reboot")
 
 
 def reset_machine(host, clear_cart=True):
+    blank_basic_screen_memory(host)
     if clear_cart:
         clear_cartridge(host)
     return api_put(host, "/v1/machine:reset")
@@ -859,8 +897,7 @@ def settle_with_blank_disk_then_boot(host, drive="a", blank_path="/blank.d64", s
         print(f"STEP mounted blank: HTTP {status} {body.strip()}")
         if status_callback:
             status_callback("mounted", blank_path)
-        print("STEP wait 2s for U2 settle")
-        time.sleep(2.0)
+        print("STEP blank disk mounted; proceeding to reboot")
     except Exception as e:
         print(f"STEP blank disk warning: {e}")
     print("STEP cold boot/reset")
@@ -1770,6 +1807,17 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
     return status, body
 
 
+def emit_launch_status(status_callback, text, kind="normal"):
+    if not status_callback:
+        return
+    try:
+        status_callback(text, kind)
+    except TypeError:
+        # Some launch paths use event-style callbacks, e.g. callback("mounted", path).
+        # For simple text status, fall back to the older one-argument shape.
+        status_callback(text)
+
+
 def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False, status_callback=None):
     if not payload.startswith("U2+:"):
         raise RuntimeError("Payload does not start with U2+:")
@@ -1783,15 +1831,8 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
             print(f"Extracted {name!r}, {len(blob)} bytes")
         if not blob:
             raise RuntimeError(f"Downloaded PRG payload is 0 bytes: {path}")
-        if lower.endswith(".prg"):
-            try:
-                emit_launch_status(status_callback, "Preparing PRG save sidecar D81", "work")
-                sidecar = ensure_prg_sidecar_d81(host, path)
-                emit_launch_status(status_callback, f"Mounting PRG save sidecar {sidecar}", "work")
-                mount_image(host, sidecar, "a")
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"WARN: could not create/mount PRG sidecar D81 for saves: {e}")
+        # Default sidecar policy is none: launch PRGs without creating/mounting
+        # a save disk unless a future configurable policy explicitly requests it.
         emit_launch_status(status_callback, "Launching PRG", "normal")
         result = post_runner(host, "/v1/runners:run_prg", blob)
         run_launch_script(host, path, target_mode)
@@ -1800,14 +1841,8 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
         blob = ftp_download(host, path)
         if not blob:
             raise RuntimeError(f"Downloaded CRT payload is 0 bytes: {path}")
-        try:
-            emit_launch_status(status_callback, "Preparing CRT save sidecar D81", "work")
-            sidecar = ensure_crt_sidecar_d81(host, path)
-            emit_launch_status(status_callback, f"Mounting CRT save sidecar {sidecar}", "work")
-            mount_image(host, sidecar, "a")
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"WARN: could not create/mount CRT sidecar D81 for saves: {e}")
+        # Default sidecar policy is none: launch CRTs without creating/mounting
+        # a save disk unless a future configurable policy explicitly requests it.
         emit_launch_status(status_callback, "Launching CRT", "normal")
         return post_runner(host, "/v1/runners:run_crt", blob)
     if mode == "sid":
