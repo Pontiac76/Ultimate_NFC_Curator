@@ -58,3 +58,7 @@ curator
 
 # Local merge/conversion logs
 merge_logs/
+
+# Local tracked-file snapshots created before commits/merges
+git_snapshots/
+test

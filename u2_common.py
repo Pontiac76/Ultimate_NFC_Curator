@@ -1702,7 +1702,7 @@ def run_launch_script(host, image_path, machine_mode, script_dir="scripts"):
     return ran
 
 
-def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False, status_callback=None):
+def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry="", skip_prehelp=False, self_boot=False, status_callback=None):
     """Cold boot, detect mode, optionally GO64, then mount/load/run a disk image.
 
     entry controls the LOAD target for disk mode. Blank means LOAD"*".
@@ -1769,6 +1769,14 @@ def boot_mount_load_run(host, image_path, target_mode="c64", drive="a", entry=""
     if status_callback:
         status_callback("mounted", image_path)
 
+    if self_boot and target_mode == "c128":
+        print("STEP self-boot enabled; rebooting with target disk mounted")
+        if status_callback:
+            status_callback("rebooting", None)
+        reboot_machine(host)
+        print("STEP self-boot launch complete")
+        return status, body
+
     load_target = entry or "*"
     print(f'STEP send LOAD command: lO"{load_target}",8,1')
     if status_callback:
@@ -1818,7 +1826,7 @@ def emit_launch_status(status_callback, text, kind="normal"):
         status_callback(text)
 
 
-def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False, status_callback=None):
+def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", skip_prehelp=False, self_boot=False, status_callback=None):
     if not payload.startswith("U2+:"):
         raise RuntimeError("Payload does not start with U2+:")
     mode, rest = payload[4:].split(":", 1)
@@ -1853,7 +1861,7 @@ def launch_payload(host, payload, d64_as_prg_loader=True, target_mode="c64", ski
     if mode in ("d64", "disk"):
         image_exts = (".d64", ".d71", ".d81")
         if lower.endswith(image_exts):
-            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp, status_callback=status_callback)
+            return boot_mount_load_run(host, path, target_mode=target_mode, drive="a", entry=entry, skip_prehelp=skip_prehelp, self_boot=self_boot, status_callback=status_callback)
         if lower.endswith((".g64", ".tap")):
             raise RuntimeError("G64/TAP launch is intentionally unsupported for now")
     raise RuntimeError(f"Unsupported launch mode {mode!r} for path {path!r}")
@@ -1925,6 +1933,7 @@ def ensure_rows_table(conn, fields=None):
             quarantine_reason TEXT NOT NULL DEFAULT '',
             deleted_reason TEXT NOT NULL DEFAULT '',
             size_bytes INTEGER,
+            self_boot INTEGER NOT NULL DEFAULT 0,
             quarantined INTEGER NOT NULL DEFAULT 0,
             fk_Status_ID INTEGER REFERENCES Status(pk_ID),
             fk_StorageStatus_ID INTEGER REFERENCES StorageStatus(pk_ID),
@@ -1951,10 +1960,11 @@ def ensure_rows_table(conn, fields=None):
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_title ON Image(title)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_path ON Image(path)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_payload ON Image(payload)")
-    try:
-        conn.execute("ALTER TABLE Image ADD COLUMN size_bytes INTEGER")
-    except sqlite3.OperationalError:
-        pass
+    for column, definition in (("size_bytes", "INTEGER"), ("self_boot", "INTEGER NOT NULL DEFAULT 0")):
+        try:
+            conn.execute(f"ALTER TABLE Image ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
     conn.execute("CREATE INDEX IF NOT EXISTS idx_Image_Status ON Image(fk_Status_ID)")
     conn.execute(
         """
@@ -2022,6 +2032,7 @@ def ensure_rows_table(conn, fields=None):
             i.quarantine_reason,
             i.deleted_reason,
             i.size_bytes,
+            i.self_boot,
             i.notes,
             i.created_at,
             i.updated_at
@@ -2068,6 +2079,7 @@ def write_sqlite_rows(path, rows, fields):
                 "quarantine_reason": r.get("quarantine_reason", ""),
                 "deleted_reason": r.get("deleted_reason", ""),
                 "size_bytes": int(r.get("size_bytes")) if str(r.get("size_bytes", "")).strip().isdigit() else None,
+                "self_boot": 1 if str(r.get("self_boot", "")).lower() in ("1", "true", "yes", "y") else 0,
                 "quarantined": 1 if str(r.get("quarantined", "")).lower() in ("1", "true", "yes", "y") else 0,
                 "fk_Status_ID": lookup_id(conn, "Status", r.get("status", "")),
                 "fk_StorageStatus_ID": lookup_id(conn, "StorageStatus", r.get("storage_status", "present") or "present"),

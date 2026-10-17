@@ -104,7 +104,7 @@ def save_a64_search_defaults(data):
     allowed = {"name", "types", "category", "subcat", "repo", "group", "handle", "sort", "order", "latest"}
     clean = {k: str(v or "") for k, v in dict(data or {}).items() if k in allowed}
     save_tui_state(a64_search_defaults=clean)
-FIELDS = ["title", "payload", "mode", "path", "entry", "machine_mode", "file_type", "detail", "size_bytes", "status", "storage_status", "notes"]
+FIELDS = ["title", "payload", "mode", "path", "entry", "machine_mode", "file_type", "detail", "size_bytes", "self_boot", "status", "storage_status", "notes"]
 UNSUPPORTED_EXTS = (".g64", ".tap")
 UNSUPPORTED_TYPES = {"g64", "tap"}
 
@@ -209,6 +209,16 @@ def set_image_status(db_path, row, status):
             "UPDATE Image SET fk_Status_ID=?, updated_at=CURRENT_TIMESTAMP WHERE path=?",
             (lookup_id(conn, "Status", status), path),
         )
+    return True
+
+
+def set_image_self_boot(db_path, row, enabled):
+    path = row.get("path", "")
+    if not path:
+        return False
+    with sqlite_connect(db_path) as conn:
+        ensure_rows_table(conn)
+        conn.execute("UPDATE Image SET self_boot=?, updated_at=CURRENT_TIMESTAMP WHERE path=?", (1 if enabled else 0, path))
     return True
 
 
@@ -1486,7 +1496,7 @@ def launch_local_a64_candidate(stdscr, host, row, target_mode="c64", skip_prehel
         # last-known USB fallback state.
         time.sleep(0.5)
         payload = f"U2+:disk:{uploaded}" + (f"#{row.get('entry', '')}" if row.get('entry', '') else "")
-        return launch_payload(host, payload, target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=status_callback)
+        return launch_payload(host, payload, target_mode=target_mode, skip_prehelp=skip_prehelp, self_boot=bool(row.get("self_boot")), status_callback=status_callback)
     raise RuntimeError(f"Unsupported local A64 file type: {ext}")
 
 
@@ -1943,6 +1953,7 @@ def show_help(stdscr):
         "  x                Delete selected image/candidate after confirmation",
         "  u                Clear status/unmark",
         "  1  (digit one)   Toggle target machine mode: C64 <-> C128",
+        "  2  (digit two)   Toggle C128 self-boot for disk images",
         "",
         "NFC:",
         "  w                Write selected game's NFC card",
@@ -1995,7 +2006,17 @@ def show_help(stdscr):
             top = max_top
 
 
+def u2_enabled(host):
+    return bool(host)
+
+
+def u2_disabled_msg():
+    return "U2 disabled by --no-ultimate"
+
+
 def refresh_status_rows(host):
+    if not u2_enabled(host):
+        return [], u2_disabled_msg()
     try:
         return drive_status_rows(host), None
     except Exception as e:
@@ -2047,6 +2068,7 @@ def draw_detail_panel(stdscr, y, w, row, highlight=None):
         ("mode", "launch mode", row.get("mode", "")),
         ("entry", "entry", row.get("entry", "")),
         ("state", "state", row.get("status", "")),
+        ("boot", "boot", "self-boot" if row.get("self_boot") and row.get("mode") == "disk" and row.get("machine_mode") in ("c128", "128") else "load/run"),
     ]
     x = 0
     for key, name, value in fields:
@@ -2063,6 +2085,8 @@ def draw_detail_panel(stdscr, y, w, row, highlight=None):
 
 def selected_issue(host, row, cache):
     """Return human-readable issue for selected row, or empty string."""
+    if not u2_enabled(host):
+        return ""
     path = row.get("path", "")
     lower = path.lower()
     if not lower.endswith(".prg"):
@@ -2103,17 +2127,18 @@ def command_groups(row=None, issue=""):
     path = (row or {}).get("path", "")
     is_disk = path.lower().endswith((".d64", ".d71", ".d81"))
     is_a64 = is_a64_row(row or {})
+    is_c128_disk = is_disk and (row or {}).get("machine_mode", "c64") in ("c128", "128")
     can_test = not issue
     if is_a64:
         return [
             ("Nav", [("↑/↓ move", True), ("PgUp/PgDn", True), ("Home/End", True), ("/ search", True), ("V view", True), ("y A64", True), ("? help", True), ("q save+quit", True)]),
-            ("A64", [("t test", can_test), ("T test no help", can_test), ("F10 actions", True), ("p promote", True), ("f failed", True), ("x delete", True), ("u unmark", True)]),
+            ("A64", [("t test", can_test), ("T test no help", can_test), ("F10 actions", True), ("p promote", True), ("f failed", True), ("x delete", True), ("u unmark", True), ("2 self-boot", is_c128_disk)]),
             ("U2", [("M mount image", is_disk), ("G GO64/Y", True), ("B reboot", True), ("C console", True)]),
             ("Edit", [("e title/entry", True)]),
         ]
     return [
         ("Nav", [("↑/↓ move", True), ("PgUp/PgDn", True), ("Home/End", True), ("/ search", True), ("V view", True), ("H hunt tag", True), ("y A64", True), ("$ dir", is_disk), ("? help", True), ("q save+quit", True)]),
-        ("Curate", [("Space/a approve", True), ("t test", can_test), ("T test no help", can_test), ("1 64/128", True), ("f failed", True), ("x delete", True), ("u unmark", True)]),
+        ("Curate", [("Space/a approve", True), ("t test", can_test), ("T test no help", can_test), ("1 64/128", True), ("2 self-boot", is_c128_disk), ("f failed", True), ("x delete", True), ("u unmark", True)]),
         ("NFC", [("w write", True), ("r read", True), ("m monitor", True)]),
         ("U2", [("M mount image", is_disk), ("D disk swap", False), ("G GO64/Y", True), ("B reboot", True), ("C console", True)]),
         ("Edit", [("k script", True), ("e title/entry", True)]),
@@ -2371,6 +2396,7 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
         r.setdefault("status", "")
         r.setdefault("notes", "")
         r.setdefault("machine_mode", "c64")
+        r.setdefault("self_boot", 0)
     if saved_sql_view_name != "All loaded rows":
         choice = next((c for c in load_sql_view_choices() if c[0] == saved_sql_view_name), None)
         if choice:
@@ -2602,6 +2628,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                         pos = min(old_pos, len(rows) - 1)
                     top = min(top, max(0, len(rows) - 1))
         elif ch == ord('$'):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+                continue
             show_disk_directory(stdscr, host, rows[pos], allow_select=False)
             msg = "Returned from disk directory"
         elif ch == ord('/'):
@@ -2636,12 +2665,15 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 msg = "Wishlist cancelled"
                 continue
             cleared = clear_a64_inbox(state_path)
-            try:
-                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                    remote_cleared = clean_a64_test_cache(host)
-            except Exception as e:
+            if u2_enabled(host):
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                        remote_cleared = clean_a64_test_cache(host)
+                except Exception as e:
+                    remote_cleared = 0
+                    msg = f"A64 scratch cleanup warning: {e}"
+            else:
                 remote_cleared = 0
-                msg = f"A64 scratch cleanup warning: {e}"
             search_msg = a64_search_flow(stdscr, state_path, initial_data={"name": wish})
             inbox = load_a64_inbox_rows(state_path)
             if inbox:
@@ -2666,12 +2698,15 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                     rows, sql_view_name, sql_filter_keys, sql_filter_rank, top, pos, msg = enter_a64_inbox(state_path)
                 elif action == "new":
                     n = clear_a64_inbox(state_path)
-                    try:
-                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                            remote_n = clean_a64_test_cache(host)
-                    except Exception as e:
+                    if u2_enabled(host):
+                        try:
+                            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                                remote_n = clean_a64_test_cache(host)
+                        except Exception as e:
+                            remote_n = 0
+                            msg = f"A64 scratch cleanup warning: {e}"
+                    else:
                         remote_n = 0
-                        msg = f"A64 scratch cleanup warning: {e}"
                     search_msg = a64_search_flow(stdscr, state_path)
                     inbox = load_a64_inbox_rows(state_path)
                     if inbox:
@@ -2736,6 +2771,16 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
             rows[pos]["status"] = "" if rows[pos].get("status") == "approved" else "approved"
             set_image_status(db_path, rows[pos], rows[pos]["status"])
             msg = f"Status updated: {rows[pos].get('status') or 'unmarked'}"
+        elif ch == ord('2'):
+            row = rows[pos]
+            is_disk = row.get("mode") == "disk" or str(row.get("path", "")).lower().endswith((".d64", ".d71", ".d81"))
+            is_c128 = row.get("machine_mode", "c64") in ("c128", "128")
+            if not (is_disk and is_c128):
+                msg = "Self-boot applies only to C128 disk images"
+            else:
+                row["self_boot"] = 0 if str(row.get("self_boot", "0")).lower() in ("1", "true", "yes", "y") else 1
+                set_image_self_boot(db_path, row, row["self_boot"])
+                msg = f"C128 self-boot {'enabled' if row['self_boot'] else 'disabled'}"
         elif ch == ord('1'):
             cur = "c128" if rows[pos].get("machine_mode", "c64") in ("c128", "128") else "c64"
             rows[pos]["machine_mode"] = "c64" if cur == "c128" else "c128"
@@ -2764,7 +2809,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 status_rows, status_err = refresh_status_rows(host)
                 continue
             monitor = Path(__file__).with_name("u2_tag_monitor.py")
-            cmd = [sys.executable, str(monitor), "--ultimate", "auto", "--state", db_path]
+            cmd = [sys.executable, str(monitor), "--ultimate", host if u2_enabled(host) else "auto", "--state", db_path]
+            if not u2_enabled(host):
+                cmd.append("--no-ultimate")
             subprocess.call(cmd)
             msg = "Returned from NFC monitor"
             status_rows, status_err = refresh_status_rows(host)
@@ -2776,7 +2823,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 status_rows, status_err = refresh_status_rows(host)
                 continue
             monitor = Path(__file__).with_name("u2_tag_monitor.py")
-            cmd = [sys.executable, str(monitor), "--ultimate", "auto", "--state", db_path, "--no-launch"]
+            cmd = [sys.executable, str(monitor), "--ultimate", host if u2_enabled(host) else "auto", "--state", db_path, "--no-launch"]
+            if not u2_enabled(host):
+                cmd.append("--no-ultimate")
             subprocess.call(cmd)
             msg = "Returned from NFC read-only monitor"
             status_rows, status_err = refresh_status_rows(host)
@@ -2788,7 +2837,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 set_image_status(db_path, rows[pos], "failed")
                 msg = f"Marked failed: {rows[pos].get('title','')}"
         elif ch == ord('p'):
-            if is_a64_row(rows[pos]):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+            elif is_a64_row(rows[pos]):
                 try:
                     promoted_title = rows[pos].get('title','')
                     dest, promoted_row = promote_a64_candidate(stdscr, host, state_path, rows[pos], base_rows)
@@ -2823,7 +2874,7 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                         continue
                     if local_path and not str(local_path).startswith("/"):
                         Path(local_path).unlink(missing_ok=True)
-                    if promoted_path:
+                    if promoted_path and u2_enabled(host):
                         try:
                             ftp_delete(host, promoted_path)
                         except Exception:
@@ -2845,10 +2896,26 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                     msg = f"A64 delete failed: {e}"
             else:
                 try:
+                    if not u2_enabled(host):
+                        msg = u2_disabled_msg()
+                        continue
                     old_pos = pos
                     ok, msg = delete_curator_image(stdscr, host, state_path, rows[pos], base_rows)
                     if ok:
-                        rows = base_rows
+                        # Preserve the active SQL view after deletion; resetting to
+                        # base_rows makes the header claim (for example) Approved
+                        # while displaying every remaining image.
+                        if sql_view_name != "All loaded rows":
+                            choice = next((c for c in load_sql_view_choices() if c[0] == sql_view_name), None)
+                            if choice:
+                                try:
+                                    rows, sql_filter_keys, sql_filter_rank, sql_view_name = apply_sql_view_choice(state_path, base_rows, choice)
+                                except Exception:
+                                    rows = base_rows
+                                    sql_filter_keys = None
+                                    sql_filter_rank = None
+                        else:
+                            rows = base_rows
                         if rows:
                             pos = min(old_pos, len(rows) - 1)
                         else:
@@ -2862,6 +2929,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
             else:
                 rows[pos]["status"] = ""
         elif ch == ord('G'):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+                continue
             captured_out = io.StringIO()
             captured_err = io.StringIO()
             try:
@@ -2887,6 +2957,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 log.write(f"[tui] {msg}\n")
             status_rows, status_err = refresh_status_rows(host)
         elif ch == ord('B'):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+                continue
             captured_out = io.StringIO()
             captured_err = io.StringIO()
             try:
@@ -2905,6 +2978,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 log.write(f"[tui] {msg}\n")
             status_rows, status_err = refresh_status_rows(host)
         elif ch == ord('M'):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+                continue
             try:
                 path = rows[pos].get("path", "")
                 if not path.lower().endswith((".d64", ".d71", ".d81")):
@@ -2938,6 +3014,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
             if msg.startswith("Mount failed"):
                 status_rows, status_err = refresh_status_rows_after_drive_change(host)
         elif ch == key_f(10):
+            if not u2_enabled(host) and not is_a64_row(rows[pos]):
+                msg = u2_disabled_msg()
+                continue
             try:
                 old_pos = pos
                 pos, msg, merge_bucket = image_actions_menu(stdscr, host, rows, pos, cache=cache, bucket=merge_bucket, status_rows=status_rows)
@@ -2967,6 +3046,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
         elif ch == ord('D'):
             msg = "Disk swap workflow is reserved/not implemented yet"
         elif ch == ord('C'):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+                continue
             curses.endwin()
             command_console(host, rows[pos])
             msg = "Returned from keyboard command console"
@@ -2974,6 +3056,9 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
         elif ch == ord('s'):
             msg = "Save is automatic/on exit; explicit Save is retired"
         elif ch in (ord('t'), ord('T')):
+            if not u2_enabled(host):
+                msg = u2_disabled_msg()
+                continue
             issue = selected_issue(host, rows[pos], issue_cache)
             if issue:
                 msg = issue
@@ -3023,7 +3108,7 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                     if is_local_a64_row(rows[pos]):
                         status, body = launch_local_a64_candidate(stdscr, host, rows[pos], target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status)
                     else:
-                        status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp, status_callback=launch_status_callback)
+                        status, body = launch_payload(host, rows[pos]["payload"], d64_as_prg_loader=True, target_mode=target_mode, skip_prehelp=skip_prehelp, self_boot=bool(rows[pos].get("self_boot")), status_callback=launch_status_callback)
                 # Do NOT mark approved/selected here. User must press Space/a after visual confirmation.
                 msg = f"Test launched HTTP {status}: {body.strip()} -- if good, press Space/a to approve"
                 if ch == ord('T'):
@@ -3077,7 +3162,11 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                 else:
                     msg = f"Ignored invalid launch mode: {mode}"
             if entry == "$":
-                picked = show_disk_directory(stdscr, host, rows[pos], allow_select=True)
+                if not u2_enabled(host):
+                    picked = None
+                    msg = u2_disabled_msg()
+                else:
+                    picked = show_disk_directory(stdscr, host, rows[pos], allow_select=True)
                 if picked:
                     rows[pos]["entry"] = picked
                     msg = f"Selected entry {picked!r}"
@@ -3102,18 +3191,31 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("inventory", nargs="?", default="curator.db")
-    ap.add_argument("--ultimate", default="auto")
-    ap.add_argument("--log", default="u2_curate_tui.log")
+    ap = argparse.ArgumentParser(
+        description="Browse and curate the image inventory, optionally launching images through an Ultimate-II+.",
+        epilog="With --ultimate auto (the default), the curator searches for the U2 and prompts if it is not found. An explicit host skips discovery and uses only that host. Use --no-ultimate for NFC-only/offline operation.",
+    )
+    ap.add_argument("inventory", nargs="?", default="curator.db", help="curator inventory database (default: curator.db)")
+    ap.add_argument("--ultimate", default="auto", metavar="HOST|auto", help="Ultimate-II+ hostname/IP; auto searches for it (default: auto)")
+    ap.add_argument("--no-ultimate", action="store_true", help="offline/NFC-only mode; do not discover or call the U2")
+    ap.add_argument("--log", default="u2_curate_tui.log", help="TUI log file (default: u2_curate_tui.log)")
     ap.add_argument("--include-unsupported", action="store_true", help="show G64/TAP rows too")
-    ap.add_argument("--import-approved", action="store_true", help="one-time import approved manifest even when curator state exists, then archive it")
     ap.add_argument("--no-cache", action="store_true", help="disable session file cache for downloaded/uploaded images")
     ap.add_argument("--cache-dir", default="auto", help="session cache directory base; default auto uses /dev/shm when available")
     args = ap.parse_args()
-    host = discover_ultimate() if args.ultimate == "auto" else args.ultimate
-    if not host:
-        raise SystemExit(1)
+    host = None if args.no_ultimate else (discover_ultimate() if args.ultimate == "auto" else args.ultimate)
+    while not args.no_ultimate and not host:
+        ans = input("Ultimate-II+ not found. [L]oad without U2, [R]etry scan, or [E]xit? ").strip().lower()
+        if ans in ("", "r", "retry"):
+            host = discover_ultimate() if args.ultimate == "auto" else args.ultimate
+        elif ans in ("l", "load", "offline", "no-ultimate"):
+            args.no_ultimate = True
+            host = None
+            break
+        elif ans in ("e", "exit", "q", "quit"):
+            raise SystemExit(1)
+        else:
+            print("Please enter L, R, or E.")
     nfc_ok, nfc_info = ensure_nfc_reader_connected()
     startup_nfc_msg = f"NFC reader ready: {nfc_info}" if nfc_ok else f"NFC reader unavailable: {nfc_info}"
     print(startup_nfc_msg)

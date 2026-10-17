@@ -274,18 +274,23 @@ def main():
     ap.add_argument("--baud", type=int, default=115200, choices=[9600, 19200, 38400, 57600, 115200])
     ap.add_argument("--no-auto-attach", action="store_true", help="do not run scripts/attach-nfc-wsl.sh when the reader device is missing")
     ap.add_argument("--ultimate", default="auto")
+    ap.add_argument("--no-ultimate", action="store_true", help="do not discover or call the Ultimate-II+; implies read-only/no-launch mode")
     ap.add_argument("--state", action="append", default=["curator.db"], help="SQLite launch DB or legacy TSV/CSV manifest; may be repeated")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--no-launch", action="store_true", help="read/print tag contents but do not launch anything")
     ap.add_argument("--no-color", action="store_true", help="disable ANSI color/status output")
     args = ap.parse_args()
 
-    host = discover_ultimate() if args.ultimate == "auto" else args.ultimate
-    if not host:
-        raise SystemExit("Could not find Ultimate-II+")
+    if args.no_ultimate:
+        args.no_launch = True
+        host = None
+    else:
+        host = discover_ultimate() if args.ultimate == "auto" else args.ultimate
+        if not host:
+            raise SystemExit("Could not find Ultimate-II+")
     db = load_launch_db(args.state)
     color_enabled = not args.no_color
-    state(ANSI_CYAN, "INIT", f"Ultimate: {host}", color_enabled)
+    state(ANSI_CYAN, "INIT", f"Ultimate: {host or 'disabled'}", color_enabled)
     state(ANSI_CYAN, "INIT", f"Loaded {len(db)} launch DB row(s)", color_enabled)
     state(ANSI_GREEN, "READY", "Monitoring NFC reader. Press q to exit.", color_enabled)
 

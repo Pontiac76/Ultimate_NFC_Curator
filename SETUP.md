@@ -24,6 +24,14 @@ cd ~/git/GitHub/Ultimate_NFC_Curator
 
 ## Fresh Raspberry Pi / Debian setup
 
+Project-specific appliance setup for the 5-inch LCD Raspberry Pi unit is in:
+
+```text
+RASPBERRY_PI_APPLIANCE_SETUP.md
+```
+
+Baseline Debian/Pi package setup:
+
 Run:
 
 ```bash
