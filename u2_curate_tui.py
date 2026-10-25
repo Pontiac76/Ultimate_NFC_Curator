@@ -1962,7 +1962,8 @@ def show_help(stdscr):
         "",
         "Editing/saving:",
         "  k                Edit post-launch key script for selected image",
-        "  e                Edit soft title, launch mode/entry (* clears entry)",
+        "  e / F2            Edit selected image settings",
+
         "  G  (capital G)   Send GO64, wait for prompt, then send Y",
         "  B  (capital B)   Reboot Ultimate/machine via API",
         "  C  (capital C)   Open simple keyboard command console",
@@ -2134,14 +2135,14 @@ def command_groups(row=None, issue=""):
             ("Nav", [("↑/↓ move", True), ("PgUp/PgDn", True), ("Home/End", True), ("/ search", True), ("V view", True), ("y A64", True), ("? help", True), ("q save+quit", True)]),
             ("A64", [("t test", can_test), ("T test no help", can_test), ("F10 actions", True), ("p promote", True), ("f failed", True), ("x delete", True), ("u unmark", True), ("2 self-boot", is_c128_disk)]),
             ("U2", [("M mount image", is_disk), ("G GO64/Y", True), ("B reboot", True), ("C console", True)]),
-            ("Edit", [("e title/entry", True)]),
+            ("Edit", [("e/F2 settings", True)]),
         ]
     return [
         ("Nav", [("↑/↓ move", True), ("PgUp/PgDn", True), ("Home/End", True), ("/ search", True), ("V view", True), ("H hunt tag", True), ("y A64", True), ("$ dir", is_disk), ("? help", True), ("q save+quit", True)]),
         ("Curate", [("Space/a approve", True), ("t test", can_test), ("T test no help", can_test), ("1 64/128", True), ("2 self-boot", is_c128_disk), ("f failed", True), ("x delete", True), ("u unmark", True)]),
         ("NFC", [("w write", True), ("r read", True), ("m monitor", True)]),
         ("U2", [("M mount image", is_disk), ("D disk swap", False), ("G GO64/Y", True), ("B reboot", True), ("C console", True)]),
-        ("Edit", [("k script", True), ("e title/entry", True)]),
+        ("Edit", [("k script", True), ("e/F2 settings", True)]),
     ]
 
 
@@ -3129,7 +3130,7 @@ def run(stdscr, rows, host, db_path, log_path, startup_msg="", cache=None):
                     log.write("[stderr]\n" + captured_err.getvalue())
                 log.write(f"[tui] {msg}\n")
             status_rows, status_err = refresh_status_rows(host)
-        elif ch == ord('e'):
+        elif ch in (ord('e'), key_f(2)):
             curses.echo(); curses.curs_set(1)
             prompt = f"New soft title (blank keeps {rows[pos].get('title','')!r}): "
             stdscr.move(h-1, 0); stdscr.clrtoeol()
